@@ -1,0 +1,30 @@
+#!/bin/bash
+
+# Ensure a computer name is provided
+if [ -z "$1" ]; then
+    echo "Usage: $0 <computer_name>"
+    exit 1
+fi
+
+COMPUTER_NAME=$1
+
+# Step 1: Search for the computer object in AD
+echo "Searching for computer object: $COMPUTER_NAME"
+adquery user $COMPUTER_NAME &>/dev/null
+
+if [ $? -ne 0 ]; then
+    echo "Computer object '$COMPUTER_NAME' not found in Active Directory."
+    exit 2
+fi
+
+# Step 2: Get the zone information
+echo "Querying zone for computer: $COMPUTER_NAME"
+
+ZONE_INFO=$(adinfo -y 2>/dev/null | grep "Centrify zone:")
+
+if [ -z "$ZONE_INFO" ]; then
+    echo "Could not determine zone. Ensure Centrify is installed and the system is joined to a zone."
+    exit 3
+fi
+
+echo "Computer '$COMPUTER_NAME' is in zone: ${ZONE_INFO#*: }"
