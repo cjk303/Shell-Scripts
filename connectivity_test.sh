@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+
+################################################################################
+#                                                                              # 
+# Run this script on a newly created VM, to determine if it can be onboarded   #
+# This will check for required connectivity to foreman repos, AD servers, and  #
+# various endpoints necessary for ARC.                                         #
+#                                                                              # 
+################################################################################
+#set -x
+set -uo pipefail
+
+IP_RE='(\b25[0-5]|\b2[0-4][0-9]|\b[01]?[0-9][0-9]?)(\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}'
+
+usage () {
+echo "usage: $0 <domain> <datacenter>"
+echo "example: $0 amer.epiqcorp.com lvdc"
+echo
+exit 0
+}
+
+
+# does the user need help?
+if [[ -z $1 || "-h" == ${1:0:2} ]]
+    then
+        usage
+fi
+
+# set up variables
+
+# used for getting the AD servers to test for centrify
+domain=$1
+
+# used to lookup the solarwinds pollers, forcing lowercase on user input
+data_center=${2,,}
+
+# having to hard code solarwinds pollers :(
+declare -A sw_pollers
+sw_pollers['dedc']='dedc'
+sw_pollers['hkdc']='hkdc'
+sw_pollers['kadc']='kadc'
+sw_pollers['lfdc']='lfdc'
+sw_pollers['lvdc']='lvdc'
+sw_pollers['tkdc']='tkdc'
+sw_pollers['tudc']='tudc'
+sw_pollers['sdc']='sdc'
+sw_pollers['ukdc']='ukdc'
+
+dedc="10.104.15.14"
+hkdc="10.163.15.19 10.163.15.15"
+kadc="10.106.68.19"
+lfdc="10.99.16.24"
+lvdc="10.35.15.51 10.35.15.57 10.35.15.60 10.35.15.56 10.35.15.53 10.35.15.59 10.35.15.54 10.35.15.140 10.35.15.68 10.35.15.52 10.35.15.120 10.35.15.58 10.35.15.150"
+tkdc="10.94.68.23 10.94.68.20"
+tudc="10.92.11.49"
+sdc="10.92.11.49"
+ukdc="10.100.15.10 10.100.15.14 10.100.15.15"
+
+
+# abstracted function for most of our connectivity tests
+tcp_connection_test() {
+    local calling_test=$1
+    local addr_under_test=$2
+    local port=$3
+    
+    connected=$(timeout 1 bash -c "cat < /dev/null > /dev/tcp/$addr_under_test/$port" 2>/dev/null)
+    if [[ 0 -ne $? ]]
+    then
+        echo "$calling_test FAIL: Can't connect to $addr_under_test on port $port"
+    else
+        echo "$calling_test SUCCESS: Connected to $addr_under_test on port $port"
+    fi
+}
+
+#tcp_connection_test() {
+#    local calling_test=$1
+#    local addr_under_test=$2
+#    local port=$3
+#    
+#    connected=$(nc -zvw 5 $addr_under_test $port 2>&1 > /dev/null)
+#    if [[ 0 -ne $? ]]
+#    then
+#        echo "$calling_test FAIL: Can't connect to $addr_under_test on port $port"
+#    else
+#        echo "$calling_test SUCCESS: Connected to $addr_under_test on port $port"
+#    fi
+#}
+
+
+#########################
+#                       #
+# Execution begins here #
+#                       #
+#########################
+
+# test local gateway first
+gateway=$(ip route | egrep default | egrep -o $IP_RE)
+gateway_access=$(ping -c 1 -w 1 $gateway 2>&1 | tr '\n' ' ' | egrep '\b0%')
+
+if [[ -n $gateway_access ]]
+then
+    echo "GATEWAY SUCCESS: can ping ${gateway}"
+else
+    echo "GATEWAY FAIL: can't ping $gateway, halting."
+    exit 1
+fi
+
+
+# check for the presence of netcat, fail out if not present
+# may want to implement this instead of relying on netcat: https://stackoverflow.com/a/19866239
+if ! command -v nc >/dev/null 2>&1
+then
+    echo "nc could not be found, required for testing tcp connectivity, halting."
+    echo "try apt install ncat or dnf install ncat"
+    exit 1
+fi
+
+# test DNS access
+for ip in 10.255.0.10 10.255.0.11
+    do tcp_connection_test 'DNS' $ip 53
+    done
+
+# ensure we can onboard for ARC
+for azure in agentserviceapi.guestconfiguration.azure.com gbl.his.arc.azure.com login.microsoftonline.com management.azure.com pas.windows.net westus-gas.guestconfiguration.azure.com wus2.his.arc.azure.com aka.ms
+    do  tcp_connection_test 'AZURE' $azure 443
+    done
+
+# test to make sure we can reach our local repos
+for repo in p054lnxrepo01.epiqcorp.com p054lnxfore01.epiqcorp.com
+    do for p in 80 443
+        do tcp_connection_test 'REPO' $repo $p 
+        done
+    done
+
+# validate we have connectivity for centrify enrollment
+for ad_server in $(dig $domain ns +short | egrep -i "^[^.]+\.$domain")
+    do
+        fail=()
+        for p in 53 88 389 445 464 3268
+            do nc -zvw 1 $ad_server $p 2> /dev/null
+                if [[ 0 -ne $? ]]
+                then
+                    fail+=("$p")
+                fi
+            done
+    if [[ "0" != "${#fail[@]}" ]]
+    then
+        echo "CENTRIFY FAIL: failed to connect to port(s) ${fail[@]} on host $ad_server"
+    else
+        echo "CENTRIFY SUCCESS: $ad_server successfully connected on all ports"
+    fi 
+    done
+
+# test access to our solarwinds pollers
+pollers_to_test=${!sw_pollers[$data_center]}
+
+for poller in ${pollers_to_test[@]}
+    do tcp_connection_test 'SOLAR_WINDS' $poller 17778
+    done
+
