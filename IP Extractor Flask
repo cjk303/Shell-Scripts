@@ -8,7 +8,7 @@ app = Flask(__name__)
 IPV4_PATTERN = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
 IPV6_PATTERN = r'\b(?:[A-Fa-f0-9]{1,4}:){1,7}[A-Fa-f0-9]{1,4}\b'
 
-# Store the last extracted IPs temporarily in memory
+# Store IPs in memory for download
 last_ip_list = []
 
 HTML_TEMPLATE = '''
@@ -45,8 +45,11 @@ HTML_TEMPLATE = '''
                             <li class="list-group-item">{{ ip }}</li>
                         {% endfor %}
                     </ul>
-                    <form method="get" action="/download">
-                        <button class="btn btn-success">📥 Download IPs as TXT</button>
+                    <form method="get" action="/download/txt" class="d-inline">
+                        <button class="btn btn-success me-2">📥 Download as TXT</button>
+                    </form>
+                    <form method="get" action="/download/ansible" class="d-inline">
+                        <button class="btn btn-secondary">⚙️ Download as Ansible Hosts File</button>
                     </form>
                 {% endif %}
             </div>
@@ -68,22 +71,32 @@ def upload_file():
             ipv4s = re.findall(IPV4_PATTERN, content)
             ipv6s = re.findall(IPV6_PATTERN, content)
             ip_list = sorted(set(ipv4s + ipv6s))
-            last_ip_list = ip_list  # Save for download
+            last_ip_list = ip_list
         else:
             error = "Please upload a valid .txt file."
-    return render_template_string(HTML_TEMPLATE, ip_list=ip_list, error=error)
+    return render_template_string(HTML_TEMPLATE, ip_list=last_ip_list, error=error)
 
-@app.route('/download')
-def download_ips():
+@app.route('/download/txt')
+def download_txt():
     global last_ip_list
     if not last_ip_list:
         return "No IPs available to download.", 400
-    
     with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix=".txt") as tmp:
         tmp.write('\n'.join(last_ip_list))
         tmp_path = tmp.name
-    
     return send_file(tmp_path, as_attachment=True, download_name="extracted_ips.txt", mimetype='text/plain')
+
+@app.route('/download/ansible')
+def download_ansible():
+    global last_ip_list
+    if not last_ip_list:
+        return "No IPs available to download.", 400
+    with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix=".ini") as tmp:
+        tmp.write("[extracted]\n")
+        for ip in last_ip_list:
+            tmp.write(f"{ip}\n")
+        tmp_path = tmp.name
+    return send_file(tmp_path, as_attachment=True, download_name="ansible_hosts.ini", mimetype='text/plain')
 
 if __name__ == '__main__':
     app.run(debug=True)
