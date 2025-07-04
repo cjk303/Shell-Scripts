@@ -4,14 +4,15 @@ import tempfile
 import os
 import subprocess
 import platform
+import socket
 
 app = Flask(__name__)
 
 IPV4_PATTERN = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
 IPV6_PATTERN = r'\b(?:[A-Fa-f0-9]{1,4}:){1,7}[A-Fa-f0-9]{1,4}\b'
 
-# Store IPs in memory for download
 last_ip_list = []
+alive_hosts = []  # Store tuples of (ip, hostname or '')
 
 HTML_TEMPLATE = '''
 <!doctype html>
@@ -31,6 +32,17 @@ HTML_TEMPLATE = '''
                 button.textContent = '✅ Alive';
                 button.classList.remove('btn-secondary');
                 button.classList.add('btn-success');
+                if(data.hostname) {
+                    // Show hostname next to button
+                    let span = document.getElementById('host-'+ip);
+                    if(!span) {
+                        span = document.createElement('span');
+                        span.id = 'host-'+ip;
+                        span.className = 'ms-2 text-muted';
+                        button.parentNode.appendChild(span);
+                    }
+                    span.textContent = ' (' + data.hostname + ')';
+                }
             } else {
                 button.textContent = '❌ Not Alive';
                 button.classList.remove('btn-secondary');
@@ -43,6 +55,57 @@ HTML_TEMPLATE = '''
         }
         button.disabled = false;
     }
+
+    async function checkAllHosts() {
+        const listItems = document.querySelectorAll('li.list-group-item');
+        const allButton = document.getElementById('checkAllBtn');
+        allButton.disabled = true;
+        allButton.textContent = 'Checking all...';
+
+        for (const li of listItems) {
+            const ip = li.dataset.ip;
+            const btn = li.querySelector('button');
+            if(btn) {
+                btn.disabled = true;
+                btn.textContent = 'Checking...';
+
+                try {
+                    const response = await fetch('/check_host?ip=' + ip);
+                    const data = await response.json();
+                    if (data.alive) {
+                        btn.textContent = '✅ Alive';
+                        btn.classList.remove('btn-secondary');
+                        btn.classList.add('btn-success');
+
+                        // Add or update hostname span
+                        let span = document.getElementById('host-'+ip);
+                        if(!span) {
+                            span = document.createElement('span');
+                            span.id = 'host-'+ip;
+                            span.className = 'ms-2 text-muted';
+                            btn.parentNode.appendChild(span);
+                        }
+                        span.textContent = ' (' + (data.hostname || 'no hostname') + ')';
+                    } else {
+                        btn.textContent = '❌ Not Alive';
+                        btn.classList.remove('btn-secondary');
+                        btn.classList.add('btn-danger');
+                    }
+                } catch (err) {
+                    btn.textContent = 'Error';
+                    btn.classList.remove('btn-secondary');
+                    btn.classList.add('btn-warning');
+                }
+                btn.disabled = false;
+            }
+        }
+
+        // After checking all, enable the save alive hosts buttons
+        document.getElementById('saveAliveSection').style.display = 'block';
+        allButton.disabled = false;
+        allButton.textContent = 'Check All Hosts';
+    }
+
     </script>
 </head>
 <body class="bg-light">
@@ -66,20 +129,33 @@ HTML_TEMPLATE = '''
                 
                 {% if ip_list %}
                     <h5 class="mb-3">✅ Found {{ ip_list|length }} unique IP address{{ 'es' if ip_list|length > 1 else '' }}:</h5>
+                    <button id="checkAllBtn" class="btn btn-info mb-3" onclick="checkAllHosts()">Check All Hosts</button>
                     <ul class="list-group mb-3">
                         {% for ip in ip_list %}
-                            <li class="list-group-item d-flex justify-content-between align-items-center">
+                            <li class="list-group-item d-flex justify-content-between align-items-center" data-ip="{{ ip }}">
                                 {{ ip }}
                                 <button class="btn btn-sm btn-secondary" onclick="checkHost('{{ ip }}', this)">Check</button>
                             </li>
                         {% endfor %}
                     </ul>
+
                     <form method="get" action="/download/txt" class="d-inline">
                         <button class="btn btn-success me-2">📥 Download as TXT</button>
                     </form>
                     <form method="get" action="/download/ansible" class="d-inline">
                         <button class="btn btn-secondary">⚙️ Download as Ansible Hosts File</button>
                     </form>
+
+                    <!-- New section for alive hosts download buttons -->
+                    <div id="saveAliveSection" style="display:none;" class="mt-4">
+                        <h5>Download Alive Hosts:</h5>
+                        <form method="get" action="/download/alive/txt" class="d-inline">
+                            <button class="btn btn-success me-2">📥 Download Alive as TXT</button>
+                        </form>
+                        <form method="get" action="/download/alive/ansible" class="d-inline">
+                            <button class="btn btn-secondary">⚙️ Download Alive as Ansible Hosts File</button>
+                        </form>
+                    </div>
                 {% endif %}
             </div>
         </div>
@@ -89,9 +165,7 @@ HTML_TEMPLATE = '''
 '''
 
 def ping_host(ip):
-    """Ping IP and return True if alive, False otherwise."""
     param = '-n' if platform.system().lower() == 'windows' else '-c'
-    # Ping once, timeout 2 seconds
     command = ['ping', param, '1', '-W', '2', ip] if platform.system().lower() != 'windows' else ['ping', param, '1', ip]
     try:
         result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -99,20 +173,38 @@ def ping_host(ip):
     except Exception:
         return False
 
+def get_hostname(ip):
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except Exception:
+        return ''
+
 @app.route('/check_host')
 def check_host():
     ip = request.args.get('ip', '')
-    # Simple validation on IP format
     if not ip or not (re.match(IPV4_PATTERN, ip) or re.match(IPV6_PATTERN, ip)):
         return jsonify({'alive': False, 'error': 'Invalid IP'})
     alive = ping_host(ip)
-    return jsonify({'alive': alive})
+    hostname = get_hostname(ip) if alive else ''
+    
+    # Update global alive_hosts list on server side (optional, not critical for UI, but for download)
+    global alive_hosts
+    if alive:
+        # Add only if not already present
+        if not any(ip == a[0] for a in alive_hosts):
+            alive_hosts.append((ip, hostname))
+    else:
+        # Remove if previously marked alive but now not
+        alive_hosts = [a for a in alive_hosts if a[0] != ip]
+
+    return jsonify({'alive': alive, 'hostname': hostname})
 
 @app.route('/', methods=['GET', 'POST'])
 def upload_file():
-    global last_ip_list
+    global last_ip_list, alive_hosts
     ip_list = []
     error = None
+    alive_hosts = []  # reset alive hosts on new upload
     if request.method == 'POST':
         file = request.files.get('file')
         if file and file.filename.endswith('.txt'):
@@ -146,6 +238,31 @@ def download_ansible():
             tmp.write(f"{ip}\n")
         tmp_path = tmp.name
     return send_file(tmp_path, as_attachment=True, download_name="ansible_hosts.ini", mimetype='text/plain')
+
+# New routes for alive hosts downloads
+
+@app.route('/download/alive/txt')
+def download_alive_txt():
+    global alive_hosts
+    if not alive_hosts:
+        return "No alive hosts available to download.", 400
+    with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix=".txt") as tmp:
+        # Write only IPs
+        tmp.write('\n'.join(ip for ip, _ in alive_hosts))
+        tmp_path = tmp.name
+    return send_file(tmp_path, as_attachment=True, download_name="alive_hosts.txt", mimetype='text/plain')
+
+@app.route('/download/alive/ansible')
+def download_alive_ansible():
+    global alive_hosts
+    if not alive_hosts:
+        return "No alive hosts available to download.", 400
+    with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix=".ini") as tmp:
+        tmp.write("[alive_hosts]\n")
+        for ip, _ in alive_hosts:
+            tmp.write(f"{ip}\n")
+        tmp_path = tmp.name
+    return send_file(tmp_path, as_attachment=True, download_name="alive_hosts.ini", mimetype='text/plain')
 
 if __name__ == '__main__':
     app.run(debug=True)
