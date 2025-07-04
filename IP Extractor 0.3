@@ -1,0 +1,147 @@
+from flask import Flask, request, render_template_string, send_file
+import re
+import tempfile
+import subprocess
+import platform
+
+app = Flask(__name__)
+
+IPV4_PATTERN = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
+IPV6_PATTERN = r'\b(?:[A-Fa-f0-9]{1,4}:){1,7}[A-Fa-f0-9]{1,4}\b'
+
+last_ip_list = []
+reachable_ips = []
+unreachable_ips = []
+
+HTML_TEMPLATE = '''
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>IP Address Extractor</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+    <div class="container py-5">
+        <div class="card shadow-lg">
+            <div class="card-body">
+                <h2 class="card-title mb-4 text-center">🧠 IP Address Extractor with Ping</h2>
+                <form method="post" enctype="multipart/form-data" class="mb-4">
+                    <div class="mb-3">
+                        <label for="file" class="form-label">Upload a .txt file</label>
+                        <input class="form-control" type="file" name="file" id="file" accept=".txt" required>
+                    </div>
+                    <div class="d-grid">
+                        <button class="btn btn-primary" type="submit">Extract & Ping IPs</button>
+                    </div>
+                </form>
+                
+                {% if error %}
+                    <div class="alert alert-danger">{{ error }}</div>
+                {% endif %}
+                
+                {% if reachable_ips or unreachable_ips %}
+                    <h5 class="mt-4">🟢 Reachable Hosts</h5>
+                    {% if reachable_ips %}
+                        <ul class="list-group mb-3">
+                        {% for ip in reachable_ips %}
+                            <li class="list-group-item text-success">{{ ip }}</li>
+                        {% endfor %}
+                        </ul>
+                    {% else %}
+                        <p class="text-muted">No reachable hosts found.</p>
+                    {% endif %}
+
+                    <h5>🔴 Unreachable Hosts</h5>
+                    {% if unreachable_ips %}
+                        <ul class="list-group mb-3">
+                        {% for ip in unreachable_ips %}
+                            <li class="list-group-item text-danger">{{ ip }}</li>
+                        {% endfor %}
+                        </ul>
+                    {% else %}
+                        <p class="text-muted">No unreachable hosts found.</p>
+                    {% endif %}
+
+                    <form method="get" action="/download/txt" class="d-inline me-2">
+                        <button class="btn btn-success">📥 Download as TXT</button>
+                    </form>
+                    <form method="get" action="/download/ansible" class="d-inline">
+                        <button class="btn btn-secondary">⚙️ Download as Ansible Hosts File</button>
+                    </form>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+'''
+
+def ping_host(ip):
+    """Returns True if host responds to a ping."""
+    count_flag = "-n" if platform.system().lower() == "windows" else "-c"
+    try:
+        result = subprocess.run(["ping", count_flag, "1", ip],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+@app.route('/', methods=['GET', 'POST'])
+def upload_file():
+    global last_ip_list, reachable_ips, unreachable_ips
+    last_ip_list = []
+    reachable_ips = []
+    unreachable_ips = []
+    error = None
+
+    if request.method == 'POST':
+        file = request.files.get('file')
+        if file and file.filename.endswith('.txt'):
+            content = file.read().decode('utf-8', errors='ignore')
+            ipv4s = re.findall(IPV4_PATTERN, content)
+            ipv6s = re.findall(IPV6_PATTERN, content)
+            all_ips = sorted(set(ipv4s + ipv6s))
+            last_ip_list = all_ips
+
+            for ip in all_ips:
+                if ping_host(ip):
+                    reachable_ips.append(ip)
+                else:
+                    unreachable_ips.append(ip)
+        else:
+            error = "Please upload a valid .txt file."
+
+    return render_template_string(
+        HTML_TEMPLATE,
+        reachable_ips=reachable_ips,
+        unreachable_ips=unreachable_ips,
+        error=error
+    )
+
+@app.route('/download/txt')
+def download_txt():
+    if not last_ip_list:
+        return "No IPs available to download.", 400
+    with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix=".txt") as tmp:
+        tmp.write('\n'.join(last_ip_list))
+        tmp_path = tmp.name
+    return send_file(tmp_path, as_attachment=True, download_name="extracted_ips.txt", mimetype='text/plain')
+
+@app.route('/download/ansible')
+def download_ansible():
+    if not last_ip_list:
+        return "No IPs available to download.", 400
+    with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix=".ini") as tmp:
+        tmp.write("[reachable]\n")
+        for ip in reachable_ips:
+            tmp.write(f"{ip}\n")
+        tmp.write("\n[unreachable]\n")
+        for ip in unreachable_ips:
+            tmp.write(f"{ip}\n")
+        tmp_path = tmp.name
+    return send_file(tmp_path, as_attachment=True, download_name="ansible_hosts.ini", mimetype='text/plain')
+
+if __name__ == '__main__':
+    app.run(host="0.0.0.0", port=5000, debug=True)  # Publicly accessible on local network
