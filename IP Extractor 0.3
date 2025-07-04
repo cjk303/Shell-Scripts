@@ -1,76 +1,102 @@
-from flask import Flask, request, render_template_string, send_file
+from flask import Flask, request, jsonify, render_template_string, send_file
 import re
+import socket
 import tempfile
 import subprocess
 import platform
+import threading
+import time
 
 app = Flask(__name__)
 
 IPV4_PATTERN = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
 IPV6_PATTERN = r'\b(?:[A-Fa-f0-9]{1,4}:){1,7}[A-Fa-f0-9]{1,4}\b'
 
-last_ip_list = []
-reachable_ips = []
-unreachable_ips = []
+# Shared state
+progress_data = {
+    'total': 0,
+    'current': 0,
+    'start_time': None,
+    'done': False,
+    'ip_info_list': [],
+    'error': None
+}
 
 HTML_TEMPLATE = '''
 <!doctype html>
 <html lang="en">
 <head>
     <meta charset="utf-8">
-    <title>IP Address Extractor</title>
+    <title>IP Processor with Progress</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script>
+        let checkProgress = () => {
+            fetch('/progress')
+                .then(res => res.json())
+                .then(data => {
+                    document.getElementById('progressBar').style.width = data.percent + '%';
+                    document.getElementById('progressBar').innerText = data.percent + '%';
+                    document.getElementById('eta').innerText = data.eta ? 'ETA: ' + data.eta + 's' : '';
+                    if (data.done) {
+                        clearInterval(window.poller);
+                        window.location.href = '/results';
+                    }
+                });
+        };
+    </script>
+</head>
+<body class="bg-light">
+    <div class="container py-5">
+        <h2 class="mb-4 text-center">IP Extractor + Ping + Hostnames + Progress</h2>
+        <form method="post" enctype="multipart/form-data" action="/start">
+            <div class="mb-3">
+                <label class="form-label">Upload a .txt file</label>
+                <input class="form-control" type="file" name="file" accept=".txt" required>
+            </div>
+            <button class="btn btn-primary" type="submit">Start Processing</button>
+        </form>
+        <div class="mt-4">
+            <div class="progress">
+                <div id="progressBar" class="progress-bar" role="progressbar" style="width: 0%">0%</div>
+            </div>
+            <div class="mt-2" id="eta"></div>
+        </div>
+    </div>
+    <script>
+        if (window.location.pathname === '/') {
+            window.poller = setInterval(checkProgress, 1000);
+        }
+    </script>
+</body>
+</html>
+'''
+
+RESULT_TEMPLATE = '''
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Results</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
 </head>
 <body class="bg-light">
     <div class="container py-5">
-        <div class="card shadow-lg">
-            <div class="card-body">
-                <h2 class="card-title mb-4 text-center">🧠 IP Address Extractor with Ping</h2>
-                <form method="post" enctype="multipart/form-data" class="mb-4">
-                    <div class="mb-3">
-                        <label for="file" class="form-label">Upload a .txt file</label>
-                        <input class="form-control" type="file" name="file" id="file" accept=".txt" required>
-                    </div>
-                    <div class="d-grid">
-                        <button class="btn btn-primary" type="submit">Extract & Ping IPs</button>
-                    </div>
-                </form>
-                
-                {% if error %}
-                    <div class="alert alert-danger">{{ error }}</div>
-                {% endif %}
-                
-                {% if reachable_ips or unreachable_ips %}
-                    <h5 class="mt-4">🟢 Reachable Hosts</h5>
-                    {% if reachable_ips %}
-                        <ul class="list-group mb-3">
-                        {% for ip in reachable_ips %}
-                            <li class="list-group-item text-success">{{ ip }}</li>
-                        {% endfor %}
-                        </ul>
-                    {% else %}
-                        <p class="text-muted">No reachable hosts found.</p>
-                    {% endif %}
-
-                    <h5>🔴 Unreachable Hosts</h5>
-                    {% if unreachable_ips %}
-                        <ul class="list-group mb-3">
-                        {% for ip in unreachable_ips %}
-                            <li class="list-group-item text-danger">{{ ip }}</li>
-                        {% endfor %}
-                        </ul>
-                    {% else %}
-                        <p class="text-muted">No unreachable hosts found.</p>
-                    {% endif %}
-
-                    <form method="get" action="/download/txt" class="d-inline me-2">
-                        <button class="btn btn-success">📥 Download as TXT</button>
-                    </form>
-                    <form method="get" action="/download/ansible" class="d-inline">
-                        <button class="btn btn-secondary">⚙️ Download as Ansible Hosts File</button>
-                    </form>
-                {% endif %}
-            </div>
+        <h2 class="mb-4 text-center">Results</h2>
+        <h5>🟢 Reachable Hosts</h5>
+        <ul class="list-group mb-4">
+        {% for item in reachable %}
+            <li class="list-group-item text-success">{{ item.ip }}{% if item.hostname %} ({{ item.hostname }}){% endif %}</li>
+        {% endfor %}
+        </ul>
+        <h5>🔴 Unreachable Hosts</h5>
+        <ul class="list-group">
+        {% for item in unreachable %}
+            <li class="list-group-item text-danger">{{ item.ip }}{% if item.hostname %} ({{ item.hostname }}){% endif %}</li>
+        {% endfor %}
+        </ul>
+        <div class="mt-4">
+            <a href="/download/txt" class="btn btn-success me-2">Download TXT</a>
+            <a href="/download/ansible" class="btn btn-secondary">Download Ansible</a>
         </div>
     </div>
 </body>
@@ -78,7 +104,6 @@ HTML_TEMPLATE = '''
 '''
 
 def ping_host(ip):
-    """Returns True if host responds to a ping."""
     count_flag = "-n" if platform.system().lower() == "windows" else "-c"
     try:
         result = subprocess.run(["ping", count_flag, "1", ip],
@@ -88,60 +113,90 @@ def ping_host(ip):
     except Exception:
         return False
 
-@app.route('/', methods=['GET', 'POST'])
-def upload_file():
-    global last_ip_list, reachable_ips, unreachable_ips
-    last_ip_list = []
-    reachable_ips = []
-    unreachable_ips = []
-    error = None
+def resolve_hostname(ip):
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except Exception:
+        return None
 
-    if request.method == 'POST':
-        file = request.files.get('file')
-        if file and file.filename.endswith('.txt'):
-            content = file.read().decode('utf-8', errors='ignore')
-            ipv4s = re.findall(IPV4_PATTERN, content)
-            ipv6s = re.findall(IPV6_PATTERN, content)
-            all_ips = sorted(set(ipv4s + ipv6s))
-            last_ip_list = all_ips
+def process_ips(ips):
+    progress_data['start_time'] = time.time()
+    progress_data['total'] = len(ips)
+    progress_data['current'] = 0
+    progress_data['ip_info_list'] = []
+    for ip in ips:
+        reachable = ping_host(ip)
+        hostname = resolve_hostname(ip)
+        progress_data['ip_info_list'].append({
+            'ip': ip,
+            'reachable': reachable,
+            'hostname': hostname
+        })
+        progress_data['current'] += 1
+    progress_data['done'] = True
 
-            for ip in all_ips:
-                if ping_host(ip):
-                    reachable_ips.append(ip)
-                else:
-                    unreachable_ips.append(ip)
-        else:
-            error = "Please upload a valid .txt file."
+@app.route('/', methods=['GET'])
+def index():
+    return render_template_string(HTML_TEMPLATE)
 
-    return render_template_string(
-        HTML_TEMPLATE,
-        reachable_ips=reachable_ips,
-        unreachable_ips=unreachable_ips,
-        error=error
-    )
+@app.route('/start', methods=['POST'])
+def start():
+    file = request.files.get('file')
+    if file and file.filename.endswith('.txt'):
+        content = file.read().decode('utf-8', errors='ignore')
+        ipv4s = re.findall(IPV4_PATTERN, content)
+        ipv6s = re.findall(IPV6_PATTERN, content)
+        all_ips = sorted(set(ipv4s + ipv6s))
+        progress_data['done'] = False
+        threading.Thread(target=process_ips, args=(all_ips,)).start()
+        return render_template_string(HTML_TEMPLATE)
+    else:
+        progress_data['error'] = "Invalid file"
+        return "Invalid file", 400
+
+@app.route('/progress')
+def progress():
+    total = progress_data['total']
+    current = progress_data['current']
+    percent = int((current / total) * 100) if total else 0
+    elapsed = time.time() - progress_data['start_time'] if progress_data['start_time'] else 0
+    eta = int((elapsed / current) * (total - current)) if current else None
+    return jsonify({
+        'percent': percent,
+        'eta': eta,
+        'done': progress_data['done']
+    })
+
+@app.route('/results')
+def results():
+    reachable = [i for i in progress_data['ip_info_list'] if i['reachable']]
+    unreachable = [i for i in progress_data['ip_info_list'] if not i['reachable']]
+    return render_template_string(RESULT_TEMPLATE, reachable=reachable, unreachable=unreachable)
 
 @app.route('/download/txt')
 def download_txt():
-    if not last_ip_list:
-        return "No IPs available to download.", 400
     with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix=".txt") as tmp:
-        tmp.write('\n'.join(last_ip_list))
+        for entry in progress_data['ip_info_list']:
+            line = f"{entry['ip']}"
+            if entry['hostname']:
+                line += f" ({entry['hostname']})"
+            tmp.write(line + "\n")
         tmp_path = tmp.name
     return send_file(tmp_path, as_attachment=True, download_name="extracted_ips.txt", mimetype='text/plain')
 
 @app.route('/download/ansible')
 def download_ansible():
-    if not last_ip_list:
-        return "No IPs available to download.", 400
     with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix=".ini") as tmp:
         tmp.write("[reachable]\n")
-        for ip in reachable_ips:
-            tmp.write(f"{ip}\n")
+        for entry in progress_data['ip_info_list']:
+            if entry['reachable']:
+                tmp.write(entry['ip'] + "\n")
         tmp.write("\n[unreachable]\n")
-        for ip in unreachable_ips:
-            tmp.write(f"{ip}\n")
+        for entry in progress_data['ip_info_list']:
+            if not entry['reachable']:
+                tmp.write(entry['ip'] + "\n")
         tmp_path = tmp.name
     return send_file(tmp_path, as_attachment=True, download_name="ansible_hosts.ini", mimetype='text/plain')
 
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=5000, debug=True)  # Publicly accessible on local network
+    app.run(host="0.0.0.0", port=5000, debug=True)
