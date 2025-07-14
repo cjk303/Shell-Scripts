@@ -1,30 +1,51 @@
-#!/bin/bash
+# Function to get the Centrify zone and domain of a computer from a remote management node
+function Get-RemoteCentrifyZoneAndDomain {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$ComputerName,
 
-# Ensure a computer name is provided
-if [ -z "$1" ]; then
-    echo "Usage: $0 <computer_name>"
-    exit 1
-fi
+        [Parameter(Mandatory=$true)]
+        [string]$RemoteHost
+    )
 
-COMPUTER_NAME=$1
+    $scriptBlock = {
+        param($CompName)
 
-# Step 1: Search for the computer object in AD
-echo "Searching for computer object: $COMPUTER_NAME"
-adquery user $COMPUTER_NAME &>/dev/null
+        Import-Module Centrify.DirectControl.PowerShell
 
-if [ $? -ne 0 ]; then
-    echo "Computer object '$COMPUTER_NAME' not found in Active Directory."
-    exit 2
-fi
+        # Get the managed computer object
+        $computer = Get-CdmManagedComputer -Name $CompName
+        if ($null -eq $computer) {
+            Write-Output "❌ Computer '$CompName' not found in Centrify."
+            return
+        }
 
-# Step 2: Get the zone information
-echo "Querying zone for computer: $COMPUTER_NAME"
+        # Get the zone
+        $zone = Get-CdmZone -Guid $computer.ZoneGuid
+        $zoneName = if ($zone) { $zone.Name } else { "Unknown" }
 
-ZONE_INFO=$(adinfo -y 2>/dev/null | grep "Centrify zone:")
+        # Get the domain (from AD path)
+        $domainName = $null
+        if ($computer.DistinguishedName -match "DC=.+") {
+            $domainComponents = ($computer.DistinguishedName -split ",") | Where-Object { $_ -like "DC=*" }
+            $domainName = ($domainComponents -replace "DC=") -join "."
+        } else {
+            $domainName = "Unknown"
+        }
 
-if [ -z "$ZONE_INFO" ]; then
-    echo "Could not determine zone. Ensure Centrify is installed and the system is joined to a zone."
-    exit 3
-fi
+        # Output result
+        Write-Output "✅ Computer: $($computer.Name)"
+        Write-Output "🌐 Domain : $domainName"
+        Write-Output "📦 Zone   : $zoneName"
+    }
 
-echo "Computer '$COMPUTER_NAME' is in zone: ${ZONE_INFO#*: }"
+    try {
+        Invoke-Command -ComputerName $RemoteHost -ScriptBlock $scriptBlock -ArgumentList $ComputerName
+    }
+    catch {
+        Write-Error "❗ Remote execution failed: $_"
+    }
+}
+
+# Example usage
+Get-RemoteCentrifyZoneAndDomain -ComputerName "YOUR-COMPUTER-NAME" -RemoteHost "p016cfyammgmt01"
