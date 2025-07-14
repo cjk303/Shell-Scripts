@@ -1,51 +1,32 @@
-# Function to get the Centrify zone and domain of a computer from a remote management node
-function Get-RemoteCentrifyZoneAndDomain {
-    param (
-        [Parameter(Mandatory=$true)]
-        [string]$ComputerName,
+# Import the Centrify PowerShell module
+Import-Module Centrify.DirectControl.PowerShell
 
-        [Parameter(Mandatory=$true)]
-        [string]$RemoteHost
-    )
+# Get all managed computers from Centrify
+$computers = Get-CdmManagedComputer
 
-    $scriptBlock = {
-        param($CompName)
+# Prepare results
+$results = foreach ($computer in $computers) {
+    # Get the zone object using the Zone GUID
+    $zone = Get-CdmZone -Guid $computer.ZoneGuid
 
-        Import-Module Centrify.DirectControl.PowerShell
-
-        # Get the managed computer object
-        $computer = Get-CdmManagedComputer -Name $CompName
-        if ($null -eq $computer) {
-            Write-Output "❌ Computer '$CompName' not found in Centrify."
-            return
-        }
-
-        # Get the zone
-        $zone = Get-CdmZone -Guid $computer.ZoneGuid
-        $zoneName = if ($zone) { $zone.Name } else { "Unknown" }
-
-        # Get the domain (from AD path)
-        $domainName = $null
-        if ($computer.DistinguishedName -match "DC=.+") {
-            $domainComponents = ($computer.DistinguishedName -split ",") | Where-Object { $_ -like "DC=*" }
-            $domainName = ($domainComponents -replace "DC=") -join "."
-        } else {
-            $domainName = "Unknown"
-        }
-
-        # Output result
-        Write-Output "✅ Computer: $($computer.Name)"
-        Write-Output "🌐 Domain : $domainName"
-        Write-Output "📦 Zone   : $zoneName"
+    # Extract domain name from DN
+    $dn = $computer.DistinguishedName
+    if ($dn -match "DC=") {
+        $domainParts = ($dn -split ",") | Where-Object { $_ -like "DC=*" }
+        $domainName = ($domainParts -replace "DC=") -join "."
+    } else {
+        $domainName = "Unknown"
     }
 
-    try {
-        Invoke-Command -ComputerName $RemoteHost -ScriptBlock $scriptBlock -ArgumentList $ComputerName
-    }
-    catch {
-        Write-Error "❗ Remote execution failed: $_"
+    [PSCustomObject]@{
+        ComputerName = $computer.Name
+        Domain       = $domainName
+        Zone         = $zone.Name
     }
 }
 
-# Example usage
-Get-RemoteCentrifyZoneAndDomain -ComputerName "YOUR-COMPUTER-NAME" -RemoteHost "p016cfyammgmt01"
+# Output as table
+$results | Format-Table -AutoSize
+
+# Optionally export to CSV
+#$results | Export-Csv -Path "CentrifyComputers.csv" -NoTypeInformation
