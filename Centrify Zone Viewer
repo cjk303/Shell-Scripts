@@ -1,13 +1,9 @@
-# Import the Centrify PowerShell module
-Import-Module Centrify.DirectControl.PowerShell
+# Get all zones once
+$allZones = Get-CdmZone
 
-# Get all managed computers from Centrify
-$computers = Get-CdmManagedComputer
-
-# Prepare results
 $results = foreach ($computer in $computers) {
-    # Get the zone object using the Zone GUID
-    $zone = Get-CdmZone -Guid $computer.ZoneGuid
+    # Match zone using ZoneGuid
+    $zone = $allZones | Where-Object { $_.Guid -eq $computer.ZoneGuid }
 
     # Extract domain name from DN
     $dn = $computer.DistinguishedName
@@ -24,9 +20,3 @@ $results = foreach ($computer in $computers) {
         Zone         = $zone.Name
     }
 }
-
-# Output as table
-$results | Format-Table -AutoSize
-
-# Optionally export to CSV
-#$results | Export-Csv -Path "CentrifyComputers.csv" -NoTypeInformation
