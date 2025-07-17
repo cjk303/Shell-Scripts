@@ -1,8 +1,30 @@
 # Import the Centrify PowerShell module
 Import-Module Centrify.DirectControl.PowerShell
 
-# Get all managed computers
+# Get all managed computers and all zones
 $computers = Get-CdmManagedComputer
+$zones = Get-CdmZone
 
-# Display basic details for each computer
-$computers | Select-Object Name, DistinguishedName, ZoneGuid | Format-Table -AutoSize
+# Build a list with zone name resolution
+$results = foreach ($computer in $computers) {
+    $zoneName = "Unknown"
+
+    # Try to match the zone by ZoneGuid if available
+    if ($computer.PSObject.Properties.Name -contains "ZoneGuid" -and $computer.ZoneGuid) {
+        $matchedZone = $zones | Where-Object { $_.Guid -eq $computer.ZoneGuid }
+        if ($matchedZone) {
+            $zoneName = $matchedZone.Name
+        }
+    }
+
+    [PSCustomObject]@{
+        ComputerName = $computer.Name
+        Zone         = $zoneName
+    }
+}
+
+# Display results
+$results | Format-Table -AutoSize
+
+# Optional: Export to CSV
+# $results | Export-Csv -Path "Centrify_Computers_With_Zones.csv" -NoTypeInformation
