@@ -4,27 +4,38 @@ Import-Module Centrify.DirectControl.PowerShell
 # Get all managed computers from Centrify
 $computers = Get-CdmManagedComputer
 
-# Get all zones once to use for lookup
+# Get all zones for later matching
 $allZones = Get-CdmZone
 
 # Prepare results
 $results = foreach ($computer in $computers) {
-    # Match the zone using the ZoneGuid
-    $zone = $allZones | Where-Object { $_.Guid -eq $computer.ZoneGuid }
+    # Debug: See if ZoneGuid exists and is not empty
+    $zoneGuid = $computer.ZoneGuid
+    $zone = $null
+
+    if ($zoneGuid) {
+        $zone = $allZones | Where-Object { $_.Guid -eq $zoneGuid }
+    }
 
     # Extract domain name from Distinguished Name (DN)
     $dn = $computer.DistinguishedName
-    if ($dn -match "DC=") {
-        $domainParts = ($dn -split ",") | Where-Object { $_ -like "DC=*" }
-        $domainName = ($domainParts -replace "DC=") -join "."
-    } else {
-        $domainName = "Unknown"
+    $domainName = "Unknown"
+
+    if ($dn -and $dn -match "DC=") {
+        try {
+            $domainParts = ($dn -split ",") | Where-Object { $_ -like "DC=*" }
+            $domainName = ($domainParts -replace "DC=") -join "."
+        } catch {
+            $domainName = "ParseError"
+        }
     }
 
     [PSCustomObject]@{
         ComputerName = $computer.Name
         Domain       = $domainName
-        Zone         = if ($zone) { $zone.Name } else { "Unknown" }
+        Zone         = if ($zone) { $zone.Name } else { "Unknown or No Match" }
+        ZoneGuid     = $zoneGuid
+        DistinguishedName = $dn
     }
 }
 
