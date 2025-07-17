@@ -1,46 +1,56 @@
 # Import the Centrify PowerShell module
 Import-Module Centrify.DirectControl.PowerShell
 
-# Get all managed computers from Centrify
+# Get managed computers and all zones
 $computers = Get-CdmManagedComputer
-
-# Get all zones for later matching
 $allZones = Get-CdmZone
+
+# Optional: Dump structure of first computer and first zone for debugging
+Write-Host "Sample Computer Object:" -ForegroundColor Cyan
+$computers[0] | Format-List | Out-String | Write-Host
+
+Write-Host "Sample Zone Object:" -ForegroundColor Cyan
+$allZones[0] | Format-List | Out-String | Write-Host
 
 # Prepare results
 $results = foreach ($computer in $computers) {
-    # Debug: See if ZoneGuid exists and is not empty
-    $zoneGuid = $computer.ZoneGuid
     $zone = $null
-
-    if ($zoneGuid) {
-        $zone = $allZones | Where-Object { $_.Guid -eq $zoneGuid }
-    }
-
-    # Extract domain name from Distinguished Name (DN)
-    $dn = $computer.DistinguishedName
     $domainName = "Unknown"
 
-    if ($dn -and $dn -match "DC=") {
-        try {
-            $domainParts = ($dn -split ",") | Where-Object { $_ -like "DC=*" }
-            $domainName = ($domainParts -replace "DC=") -join "."
-        } catch {
-            $domainName = "ParseError"
+    # Try ZoneGuid match if exists
+    if ($computer.PSObject.Properties.Name -contains "ZoneGuid" -and $computer.ZoneGuid) {
+        $zone = $allZones | Where-Object { $_.Guid -eq $computer.ZoneGuid }
+    }
+
+    # Fallback: Try ZonePath or ZoneName if available
+    if (-not $zone) {
+        if ($computer.PSObject.Properties.Name -contains "ZonePath" -and $computer.ZonePath) {
+            $zone = $allZones | Where-Object { $_.ZonePath -eq $computer.ZonePath }
+        } elseif ($computer.PSObject.Properties.Name -contains "ZoneName" -and $computer.ZoneName) {
+            $zone = $allZones | Where-Object { $_.Name -eq $computer.ZoneName }
         }
     }
 
+    # Domain from DNSDomainName if DistinguishedName is empty or unhelpful
+    if ($computer.PSObject.Properties.Name -contains "DistinguishedName" -and $computer.DistinguishedName) {
+        $dn = $computer.DistinguishedName
+        if ($dn -match "DC=") {
+            $domainParts = ($dn -split ",") | Where-Object { $_ -like "DC=*" }
+            $domainName = ($domainParts -replace "DC=") -join "."
+        }
+    } elseif ($computer.PSObject.Properties.Name -contains "DNSDomainName" -and $computer.DNSDomainName) {
+        $domainName = $computer.DNSDomainName
+    }
+
     [PSCustomObject]@{
-        ComputerName = $computer.Name
-        Domain       = $domainName
-        Zone         = if ($zone) { $zone.Name } else { "Unknown or No Match" }
-        ZoneGuid     = $zoneGuid
-        DistinguishedName = $dn
+        ComputerName       = $computer.Name
+        Zone               = if ($zone) { $zone.Name } else { "Unknown or No Match" }
+        Domain             = $domainName
+        ZoneGuid           = if ($computer.PSObject.Properties.Name -contains "ZoneGuid") { $computer.ZoneGuid } else { "N/A" }
+        ZonePath           = if ($computer.PSObject.Properties.Name -contains "ZonePath") { $computer.ZonePath } else { "N/A" }
+        DistinguishedName  = if ($computer.PSObject.Properties.Name -contains "DistinguishedName") { $computer.DistinguishedName } else { "N/A" }
     }
 }
 
-# Output as table
+# Output to table
 $results | Format-Table -AutoSize
-
-# Optionally export to CSV
-# $results | Export-Csv -Path "CentrifyComputers.csv" -NoTypeInformation
