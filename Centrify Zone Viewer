@@ -4,22 +4,34 @@ Import-Module Centrify.DirectControl.PowerShell
 # Get all managed computers
 $computers = Get-CdmManagedComputer
 
-# Extract Zone name (first CN=) and show results
+# Extract zone and domain from each entry
 $results = foreach ($computer in $computers) {
+    # Get zone name (first CN= value)
     $zoneName = "Unknown"
-
     if ($computer.Zone -match "CN=([^,]+)") {
         $zoneName = $matches[1]
+    }
+
+    # Get domain name from ScpPath (join all DC= values)
+    $domainName = "Unknown"
+    if ($computer.ScpPath -match "DC=") {
+        try {
+            $domainParts = ($computer.ScpPath -split ",") | Where-Object { $_ -like "DC=*" }
+            $domainName = ($domainParts -replace "DC=") -join "."
+        } catch {
+            $domainName = "ParseError"
+        }
     }
 
     [PSCustomObject]@{
         ComputerName = $computer.Name
         Zone         = $zoneName
+        Domain       = $domainName
     }
 }
 
-# Display result
+# Display the table
 $results | Format-Table -AutoSize
 
 # Optional: Export to CSV
-# $results | Export-Csv -Path "Centrify_Computers_With_Simple_Zones.csv" -NoTypeInformation
+# $results | Export-Csv -Path "Centrify_Computers_Zone_Domain.csv" -NoTypeInformation
