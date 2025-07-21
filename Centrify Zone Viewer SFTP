@@ -1,0 +1,72 @@
+# Load the WinSCP .NET assembly
+Add-Type -Path "C:\Program Files (x86)\WinSCP\WinSCPnet.dll"
+
+# Import the Centrify PowerShell module
+Import-Module Centrify.DirectControl.PowerShell
+
+# Get all managed computers
+$computers = Get-CdmManagedComputer
+
+# Extract zone and domain from each entry
+$results = foreach ($computer in $computers) {
+    $zoneName = "Unknown"
+    if ($computer.Zone -match "CN=([^,]+)") {
+        $zoneName = $matches[1]
+    }
+
+    $domainName = "Unknown"
+    if ($computer.ScpPath -match "DC=") {
+        try {
+            $domainParts = ($computer.ScpPath -split ",") | Where-Object { $_ -like "DC=*" }
+            $domainName = ($domainParts -replace "DC=") -join "."
+        } catch {
+            $domainName = "ParseError"
+        }
+    }
+
+    [PSCustomObject]@{
+        ComputerName = $computer.Name
+        Zone         = $zoneName
+        Domain       = $domainName
+    }
+}
+
+# Export results to CSV
+$csvPath = "$env:TEMP\Centrify_Computers_Zone_Domain.csv"
+$results | Export-Csv -Path $csvPath -NoTypeInformation
+
+# WinSCP session options for SFTP
+$sessionOptions = New-Object WinSCP.SessionOptions -Property @{
+    Protocol              = [WinSCP.Protocol]::Sftp
+    HostName              = "your.server.com"
+    UserName              = "your_username"
+    Password              = "your_password"  # Or use SSH private key below
+    PortNumber            = 22
+    SshHostKeyFingerprint = "ssh-rsa 2048 xx:xx:xx:..."  # Optional but recommended
+    # SshPrivateKeyPath   = "C:\path\to\privatekey.ppk"  # Optional for key-based auth
+}
+
+$session = New-Object WinSCP.Session
+
+try {
+    $session.Open($sessionOptions)
+
+    # Upload the file
+    $transferOptions = New-Object WinSCP.TransferOptions
+    $transferOptions.TransferMode = [WinSCP.TransferMode]::Binary
+
+    $transferResult = $session.PutFiles($csvPath, "/remote/path/Centrify_Computers_Zone_Domain.csv", $False, $transferOptions)
+
+    # Confirm success
+    if ($transferResult.IsSuccess) {
+        Write-Host "SFTP upload successful."
+    } else {
+        Write-Error "SFTP upload failed."
+    }
+}
+catch {
+    Write-Error "SFTP connection or upload error: $_"
+}
+finally {
+    $session.Dispose()
+}
