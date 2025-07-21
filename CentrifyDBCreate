@@ -1,0 +1,39 @@
+#!/bin/bash
+
+# --- CONFIGURATION ---
+DB_HOST="localhost"
+DB_PORT="3306"
+DB_USER="your_mysql_user"
+DB_PASS="your_mysql_password"
+DB_NAME="your_database"
+TABLE_NAME="centrify_computers"
+CSV_FILE="Centrify_Computers_Zone_Domain.csv"
+
+# --- SQL Commands ---
+SQL_STATEMENT=$(cat <<EOF
+DROP TABLE IF EXISTS \`${TABLE_NAME}\`;
+CREATE TABLE \`${TABLE_NAME}\` (
+    \`ComputerName\` VARCHAR(255),
+    \`Zone\` VARCHAR(255),
+    \`Domain\` VARCHAR(255)
+);
+LOAD DATA LOCAL INFILE '${CSV_FILE}'
+INTO TABLE \`${TABLE_NAME}\`
+FIELDS TERMINATED BY ',' 
+ENCLOSED BY '\"'
+LINES TERMINATED BY '\n'
+IGNORE 1 ROWS
+(\`ComputerName\`, \`Zone\`, \`Domain\`);
+EOF
+)
+
+# --- Run SQL ---
+mysql --local-infile=1 -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "$SQL_STATEMENT"
+
+# --- Result ---
+if [ $? -eq 0 ]; then
+    echo "✅ CSV data imported successfully into $TABLE_NAME"
+else
+    echo "❌ Failed to import CSV data"
+    exit 1
+fi
