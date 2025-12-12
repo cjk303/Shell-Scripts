@@ -1,658 +1,138 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Unified Linux patch automation over SSH for:
-  - RHEL / Oracle Linux (dnf)
-  - Debian / Ubuntu (apt)
-
-Key behaviors:
-- Lists updates (validated).
-- Performs upgrades with optional progress streaming.
-- Checks if reboot required; can trigger reboot and perform post-reboot checks.
-- RHEL/OL: parses `dnf history info last` for authoritative "Packages Altered".
-- Debian/Ubuntu: diffs `apt-get -s dist-upgrade` before/after to build "Packages Altered".
-- Exports ALL normalized 'Packages Altered' to --changed-packages-file.
-- Prints minimal summary to stdout when --summary-only is used:
-  "Upgraded packages: <count> | Reboot performed: YES/NO | Reboot success: YES/NO"
-"""
-
+import paramiko, re, time, json, sys
 import argparse
-import json
-import logging
-import paramiko
-import re
-import sys
-import time
-import socket
 from datetime import datetime, timezone
-from typing import Optional, Tuple, List, Dict
+from typing import List, Dict, Optional, Tuple
 
-# ===== Command templates: RHEL/OL =====
-DNF_LIST_CMD_REFRESH   = "dnf -q --color=never --refresh --assumeyes list --updates"
-DNF_LIST_CMD_NOREFRESH = "dnf -q --color=never --assumeyes list --updates"
-DNF_UPGRADE_CMD        = "dnf -y --refresh upgrade"
-DNF_UPGRADE_TEST_CMD   = "dnf -y --refresh upgrade --setopt=tsflags=test"  # simulate transaction (no changes)
-DNF_HISTORY_LAST_CMD   = "dnf -q --color=never history info last"
+# ----------------- Utilities -----------------
+def _strip_ansi(s: str) -> str:
+    return re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", s or "")
 
-# ===== Command templates: Debian/Ubuntu =====
-# SWITCHED to dist-upgrade for accurate kernel/dep handling
-APT_SIMULATE_UPGRADE   = "apt-get -s dist-upgrade"
-# `apt-get update` doesn't need -y; keep a fallback OR for old images missing -y
-APT_UPDATE_CMD         = "apt-get update -y || apt-get update -o Acquire::Retries=3"
-# Upgrade with progress and no color; enforce noninteractive and avoid PTY in dpkg
-APT_UPGRADE_CMD        = (
-    "apt-get -y dist-upgrade "
-    "-o Dpkg::Progress-Fancy=1 "
-    "-o APT::Color=0 "
-    "-o Dpkg::Use-Pty=0 "
-    "-o Dpkg::Options::=--force-confdef "
-    "-o Dpkg::Options::=--force-confold"
-)
-
-# ===== Headings & stderr handling =====
-BENIGN_STDERR_PREFIXES = (
-    "Last metadata expiration check",               # EN
-    "Ostatnia kontrola wygaśnięcia metadanych",    # PL
-)
-
-# Headings in stdout we skip for dnf list/check-update output
-HEADING_PREFIXES = tuple(s.lower() for s in (
-    "updated packages",
-    "obsoleting packages",
-    "available upgrades",
-))
-
-# Noise lines sometimes printed by dnf/subscription frameworks and TTY spinners
-NOISE_PREFIXES = (
-    "Updating Subscription",
-    "Unable to read consumer identity",
-    "Subscription Management",
-    "Red Hat",
-    "Register this system",
-    "The rhc client",
-    "You can learn more",
-    "Example:",
-    "Web console:",
-    "Checking server status",  # spinner text
-)
-
-logger = logging.getLogger("dnf_updates")
-
-# ----------------- ANSI control codes stripper -----------------
-ANSI_RE = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
-
-def _strip_ansi(text: str) -> str:
-    return ANSI_RE.sub('', text or "")
-
-# ----------------- logging -----------------
-def build_logger(verbosity: int, debug: bool):
-    if debug or verbosity >= 2:
-        level = logging.DEBUG
-    elif verbosity == 1:
-        level = logging.INFO
-    else:
-        level = logging.WARNING
-
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    logger.debug("Logger initialized at level %s", logging.getLevelName(level))
-
-# ----------------- SSH helpers -----------------
-def connect(host: str, username: str, password: Optional[str], port: int, timeout: int) -> paramiko.SSHClient:
-    logger.debug("Preparing SSH client")
-    client = paramiko.SSHClient()
-    client.load_system_host_keys()  # FIXED: correct method call
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    logger.info("Connecting to %s:%s as %s", host, port, username)
-    client.connect(
-        hostname=host,
-        port=port,
-        username=username,
-        password=password,
-        timeout=timeout,
-        allow_agent=True,
-        look_for_keys=True,
-        banner_timeout=timeout,
-        auth_timeout=timeout,
-    )
-    # Keepalive to prevent idle disconnects during long operations
-    transport = client.get_transport()
-    if transport:
-        transport.set_keepalive(30)
-    return client
-
-def _tcp_port_open(host: str, port: int, timeout: float=3.0) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except Exception:
-        return False
-
-def wait_for_reconnect(host: str, username: str, password: str, port: int, wait_seconds: int) -> Optional[paramiko.SSHClient]:
-    """Poll for SSH reconnect after reboot (exponential backoff + port probe + banner/command sanity check)."""
-    logger.info("Waiting up to %ds for host to come back after reboot...", wait_seconds)
-    deadline = time.time() + wait_seconds
-    attempt, delay = 0, 5
-    last_err = None
-
-    while time.time() < deadline:
-        attempt += 1
-
-        # Quick port probe to avoid long SSH timeouts when host is still down
-        if not _tcp_port_open(host, port, timeout=3.0):
-            logger.debug("Attempt %d: TCP %s:%s not open yet; sleeping %ds", attempt, host, port, delay)
-            time.sleep(delay)
-            delay = min(delay + 5, 30)  # backoff up to 30s
-            continue
-
-        try:
-            client = connect(host, username, password, port, timeout=10)
-            # Banner/command sanity check
-            ec, _, _ = _exec_stream(client, "true", timeout=5, stream=False, get_pty=False)
-            if ec == 0:
-                logger.info("Reconnected on attempt %d (delay=%ds)", attempt, delay)
-                return client
-            else:
-                logger.debug("Attempt %d: SSH connected but remote not ready (exit=%s); sleeping %ds", attempt, ec, delay)
-                try:
-                    client.close()
-                except Exception:
-                    pass
-        except Exception as e:
-            last_err = e
-            logger.debug("Reconnect attempt %d failed: %s; sleeping %ds", attempt, e, delay)
-
-        time.sleep(delay)
-        delay = min(delay + 5, 30)  # progressive backoff
-
-    logger.error("Unable to reconnect within %ds: %s", wait_seconds, last_err)
-    return None
-
-def is_root(client: paramiko.SSHClient) -> bool:
-    ec, out, _ = _exec_stream(client, "id -u", timeout=5, stream=False, get_pty=False)
-    return (ec == 0 and _strip_ansi(out).strip() == "0")
-
-# ----------------- sanitization -----------------
-def _sanitize(text: str, secret: Optional[str]) -> str:
-    """Remove any occurrence of the sudo password from captured output."""
-    if not text or not secret:
-        return text or ""
-    return text.replace(secret, "******")
-
-# ----------------- command exec -----------------
-def _is_benign_stderr(err: str) -> bool:
-    if not err:
-        return True
-    for line in err.splitlines():
-        line = _strip_ansi(line).strip()
-        if not line:
-            continue
-        if not any(line.startswith(prefix) for prefix in BENIGN_STDERR_PREFIXES):
-            return False
-    return True
-
-def _log_stream_chunk(data: str, tag: str = "stdout", mask: Optional[str] = None):
-    """Log a chunk handling carriage-return progress lines and masking secrets."""
-    if not data:
-        return
-    # Handle carriage-return progress lines (APT prints with \r)
-    if "\r" in data and "\n" not in data:
-        status = _strip_ansi(data.split("\r")[-1]).strip()
-        if mask:
-            status = status.replace(mask, "******")
-        if status:
-            logger.info("[progress] %s", status)
-        return
-    # Else, print normal newline lines
-    for raw in data.splitlines():
-        line = _strip_ansi(raw)
-        if mask:
-            line = line.replace(mask, "******")
-        logger.info("[%s] %s", tag, line)
-
-def _exec_stream(client: paramiko.SSHClient, cmd: str, timeout: int, stream: bool, get_pty: bool=False) -> Tuple[int, str, str]:
-    """Run cmd; optionally stream live stdout/stderr. Return (exit_code, stdout, stderr)."""
-    logger.info("Running command: %s", cmd)
-    stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout, get_pty=get_pty)
-    out_chunks, err_chunks = [], []
-
-    if stream:
-        last_heartbeat = time.time()
-        while not stdout.channel.exit_status_ready():
-            while stdout.channel.recv_ready():
-                data = stdout.channel.recv(4096).decode(errors="replace")
-                out_chunks.append(data)
-                _log_stream_chunk(data, "stdout", mask=None)
-            while stdout.channel.recv_stderr_ready():
-                data = stdout.channel.recv_stderr(4096).decode(errors="replace")
-                err_chunks.append(data)
-                _log_stream_chunk(data, "stderr", mask=None)
-            # heartbeat every ~10s during quiet phases
-            if time.time() - last_heartbeat > 10:
-                logger.info("[progress] command is running…")
-                last_heartbeat = time.time()
-            time.sleep(0.1)
-        # drain
-        while stdout.channel.recv_ready():
-            data = stdout.channel.recv(4096).decode(errors="replace")
-            out_chunks.append(data)
-            _log_stream_chunk(data, "stdout", mask=None)
-        while stdout.channel.recv_stderr_ready():
-            data = stdout.channel.recv_stderr(4096).decode(errors="replace")
-            err_chunks.append(data)
-            _log_stream_chunk(data, "stderr", mask=None)
-    else:
-        out_chunks.append(stdout.read().decode(errors="replace"))
-        err_chunks.append(stderr.read().decode(errors="replace"))
-
-    exit_code = stdout.channel.recv_exit_status()
-    out = "".join(out_chunks)
-    err = "".join(err_chunks)
-
-    logger.debug("Remote command exit: %s", exit_code)
-    return exit_code, out, err
+def _exec_stream(client: paramiko.SSHClient, cmd: str, timeout: int=30,
+                 stream: bool=False, get_pty: bool=False) -> Tuple[int,str,str]:
+    stdin, stdout, stderr = client.exec_command(cmd, get_pty=get_pty, timeout=timeout)
+    out = stdout.read().decode()
+    err = stderr.read().decode()
+    ec = stdout.channel.recv_exit_status()
+    return ec, out, err
 
 def _exec_sudo(client: paramiko.SSHClient, cmd: str, sudo_password: str,
-               timeout: int, stream: bool, get_pty: bool=False) -> Tuple[int, str, str]:
-    """
-    Execute a command via sudo, supplying the password over stdin.
-    Uses: sudo -S -p ''
-    Note: When get_pty=True (requiretty), some systems echo typed input; we sanitize outputs.
-    """
-    sudo_cmd = f"sudo -S -p '' {cmd}"
-    logger.info("Running command (sudo): %s", sudo_cmd)
-    stdin, stdout, stderr = client.exec_command(sudo_cmd, timeout=timeout, get_pty=get_pty)
+               timeout: int=30, stream: bool=False, get_pty: bool=False) -> Tuple[int,str,str]:
+    full_cmd = f"sudo -S -p '' {cmd}"
+    ec, out, err = _exec_stream(client, full_cmd, timeout=timeout, stream=stream, get_pty=get_pty)
+    return ec, out, err
 
-    # Send password (once). If NOPASSWD is set, sudo will ignore it.
-    try:
-        if sudo_password:
-            stdin.write(sudo_password + "\n")
-            stdin.flush()
-            # Hint to sudo that there's no more input
-            try:
-                stdin.channel.shutdown_write()
-            except Exception:
-                pass
-    except Exception as e:
-        logger.debug("Failed to write sudo password to stdin: %s", e)
+def is_root(client: paramiko.SSHClient) -> bool:
+    ec, out, _ = _exec_stream(client, "id -u")
+    return out.strip() == "0"
 
-    out_chunks, err_chunks = [], []
-
-    if stream:
-        last_heartbeat = time.time()
-        while not stdout.channel.exit_status_ready():
-            while stdout.channel.recv_ready():
-                data = stdout.channel.recv(4096).decode(errors="replace")
-                out_chunks.append(data)
-                _log_stream_chunk(data, "stdout", mask=sudo_password or None)
-            while stdout.channel.recv_stderr_ready():
-                data = stdout.channel.recv_stderr(4096).decode(errors="replace")
-                err_chunks.append(data)
-                _log_stream_chunk(data, "stderr", mask=sudo_password or None)
-            if time.time() - last_heartbeat > 10:
-                logger.info("[progress] sudo command is running…")
-                last_heartbeat = time.time()
-            time.sleep(0.1)
-        # drain
-        while stdout.channel.recv_ready():
-            data = stdout.channel.recv(4096).decode(errors="replace")
-            out_chunks.append(data)
-            _log_stream_chunk(data, "stdout", mask=sudo_password or None)
-        while stdout.channel.recv_stderr_ready():
-            data = stdout.channel.recv_stderr(4096).decode(errors="replace")
-            err_chunks.append(data)
-            _log_stream_chunk(data, "stderr", mask=sudo_password or None)
-    else:
-        out_chunks.append(stdout.read().decode(errors="replace"))
-        err_chunks.append(stderr.read().decode(errors="replace"))
-
-    exit_code = stdout.channel.recv_exit_status()
-    # Final sanitize for captured buffers
-    out = _sanitize(_strip_ansi("".join(out_chunks)), sudo_password)
-    err = _sanitize(_strip_ansi("".join(err_chunks)), sudo_password)
-
-    logger.debug("Remote sudo command exit: %s", exit_code)
-    return exit_code, out, err
-
-# ----------------- count & validation parsers (RHEL/OL) -----------------
-def _is_noise_line(line: str) -> bool:
-    if any(line.lower().startswith(h) for h in HEADING_PREFIXES):
-        return True
-    if any(line.startswith(p) for p in NOISE_PREFIXES):
-        return True
-    if set(line) <= {"-", " "}:
-        return True
-    if line.lower().startswith("last metadata expiration"):
-        return True
-    return False
-
-def _looks_like_version(token: str) -> bool:
-    """Accept epoch:version-release or version-release (digit + '.' or '-')."""
-    return bool(re.search(r"\d", token)) and bool(re.search(r"[.\-]", token))
-
-def _looks_like_pkgname(token: str) -> bool:
-    """Accept 'name.arch' or simple 'name' with typical characters."""
-    return bool(re.match(r"^[A-Za-z0-9._+\-:]+$", token))
-
-def _count_packages_from_list_output(out: str) -> int:
-    """Strict parser for `dnf list --updates`."""
-    out = _strip_ansi(out)
-    count = 0
-    for raw in out.splitlines():
-        line = raw.strip()
-        if not line or _is_noise_line(line):
-            continue
-        parts = line.split()
-        if len(parts) < 3:
-            continue
-        pkg, ver = parts[0], parts[1]
-        if _looks_like_pkgname(pkg) and _looks_like_version(ver):
-            count += 1
-    return count
-
-def _count_packages_from_check_update(out: str) -> int:
-    """Parser for `dnf check-update` output."""
-    out = _strip_ansi(out)
-    count = 0
-    for raw in out.splitlines():
-        line = raw.strip()
-        if not line or _is_noise_line(line):
-            continue
-        parts = line.split()
-        if len(parts) < 3:
-            continue
-        pkg, ver = parts[0], parts[1]
-        if _looks_like_pkgname(pkg) and _looks_like_version(ver):
-            count += 1
-    return count
-
-# ----------------- host info & timestamps -----------------
-def _remote_time_iso(client: paramiko.SSHClient) -> str:
-    ec, out, _ = _exec_stream(client, "date -Is", timeout=5, stream=False, get_pty=False)
-    return _strip_ansi(out).strip() if ec == 0 else datetime.now(timezone.utc).isoformat()
-
-def _host_info(client: paramiko.SSHClient) -> Dict[str, str]:
-    info = {}
-    ec, fqdn, _ = _exec_stream(client, "hostname -f", timeout=5, stream=False, get_pty=False)
-    if ec != 0 or not fqdn.strip():
-        ec, fqdn, _ = _exec_stream(client, "hostname", timeout=5, stream=False, get_pty=False)
-    info["fqdn"] = _strip_ansi(fqdn).strip()
-    info["hostname"] = info["fqdn"].split(".", 1)[0] if info["fqdn"] else ""
-    ec, pretty, _ = _exec_stream(
-        client,
-        "awk -F= '$1==\"PRETTY_NAME\"{gsub(/\"/,\"\",$2);print $2}' /etc/os-release",
-        timeout=5, stream=False, get_pty=False
-    )
-    info["os"] = _strip_ansi(pretty).strip() if ec == 0 else ""
-    ec, kern, _ = _exec_stream(client, "uname -r", timeout=5, stream=False, get_pty=False)
-    info["kernel_running"] = _strip_ansi(kern).strip() if ec == 0 else ""
-    return info
-
-# ----------------- post-validation helpers (RHEL/OL) -----------------
-def _validate_with_check_update(client: paramiko.SSHClient, use_sudo: bool, timeout: int,
-                                sudo_password: Optional[str], require_pty: bool) -> Optionalcmd = "dnf check-update -q --color=never"
-    if use_sudo:
-        ec, out, _ = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout, stream=False, get_pty=require_pty)
-    else:
-        ec, out, _ = _exec_stream(client, cmd, timeout=timeout, stream=False, get_pty=False)
-    out = _strip_ansi(out)
-    if ec == 0:
-        return 0
-    if ec == 100:
-        return _count_packages_from_check_update(out)
-    logger.debug("check-update returned unexpected exit=%s; skipping validation", ec)
-    return None
-
-def _validate_with_repoquery(client: paramiko.SSHClient, use_sudo: bool, timeout: int,
-                             sudo_password: Optional[str], require_pty: bool) -> Optionalcmd = "dnf repoquery --pkgnarrow=updates -q"
-    if use_sudo:
-        ec, out, _ = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout, stream=False, get_pty=require_pty)
-    else:
-        ec, out, _ = _exec_stream(client, cmd, timeout=timeout, stream=False, get_pty=False)
-    out = _strip_ansi(out)
-    if ec != 0:
-        logger.debug("repoquery unavailable or failed (exit=%s)", ec)
-        return None
-    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
-    return len(lines)
-
-def _post_validate_count(raw_count: int, client: paramiko.SSHClient, use_sudo: bool, timeout: int,
-                         sudo_password: Optional[str], require_pty: bool) -> int:
-    if raw_count <= 0:
-        return 0
-    v = _validate_with_check_update(client, use_sudo, timeout, sudo_password, require_pty)
-    if v is not None:
-        logger.info("Post-validation (check-update) => %d", v)
-        return v
-    v2 = _validate_with_repoquery(client, use_sudo, timeout, sudo_password, require_pty)
-    if v2 is not None:
-        logger.info("Post-validation (repoquery) => %d", v2)
-        return v2
-    logger.debug("Post-validation unavailable; keeping raw count %d", raw_count)
-    return raw_count
-
-# ----------------- platform detection -----------------
 def detect_platform(client: paramiko.SSHClient) -> str:
-    ec, out, _ = _exec_stream(
-        client,
-        "grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '\"'",
-        timeout=5, stream=False, get_pty=False
-    )
-    distro = (_strip_ansi(out) or "").strip().lower()
-    if distro in ("rhel", "centos", "ol", "rocky", "almalinux", "fedora"):
-        return "rhel"
-    if distro in ("debian", "ubuntu"):
-        return "debian"
+    ec, out, _ = _exec_stream(client, "grep '^ID=' /etc/os-release || true")
+    m = re.search(r'ID=(\w+)', out or "")
+    if m:
+        return m.group(1).lower()
     return "unknown"
 
-# ----------------- DNF history parsing (authoritative “Packages Altered”) -----------------
-def _parse_history_info_last(out: str) -> Dict[str, object]:
-    tx: Dict[str, object] = {
-        "transaction_id": "",
-        "begin": "",
-        "end": "",
-        "user": "",
-        "return_code": "",
-        "releasever": "",
-        "command_line": "",
-        "packages_altered": [],
-        "upgraded_pairs": []
-    }
+def connect(host: str, user: str, password: str, port: int, timeout: int) -> paramiko.SSHClient:
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(hostname=host, username=user, password=password, port=port, timeout=timeout)
+    return client
 
-    lines = [ln.rstrip() for ln in out.splitlines()]
+def _remote_time_iso(client: paramiko.SSHClient) -> str:
+    ec, out, _ = _exec_stream(client, "date -u +%Y-%m-%dT%H:%M:%SZ")
+    return out.strip() if ec==0 else datetime.utcnow().isoformat()+'Z'
 
-    re_hdr = {
-        "transaction_id": re.compile(r"^\s*Transaction\s+ID\s*:\s*(\S+)"),
-        "begin": re.compile(r"^\s*Begin\s+time\s*:\s*(.+)$"),
-        "end": re.compile(r"^\s*End\s+time\s*:\s*(.+)$"),
-        "user": re.compile(r"^\s*User\s*:\s*(.+)$"),
-        "return_code": re.compile(r"^\s*Return\-Code\s*:\s*(.+)$"),
-        "releasever": re.compile(r"^\s*Releasever\s*:\s*(.+)$"),
-        "command_line": re.compile(r"^\s*Command\s+Line\s*:\s*(.+)$"),
-    }
+def _host_info(client: paramiko.SSHClient) -> dict:
+    info = {}
+    ec, out, _ = _exec_stream(client, "hostname")
+    info["hostname"] = out.strip() if ec==0 else "unknown"
+    ec, out, _ = _exec_stream(client, "uname -r")
+    info["kernel"] = out.strip() if ec==0 else "unknown"
+    return info
 
-    packages_altered_start = None
-    for i, ln in enumerate(lines):
-        s = ln.strip()
-        for key, rx in re_hdr.items():
-            m = rx.match(s)
-            if m:
-                tx[key] = m.group(1).strip()
-        # start marker
-        if packages_altered_start is None and s.lower().startswith("packages altered"):
-            packages_altered_start = i + 1
+# ----------------- DNF helpers -----------------
+DNF_LIST_CMD_NOREFRESH = "dnf list --updates"
+DNF_LIST_CMD_REFRESH = "dnf --refresh list --updates"
+DNF_UPGRADE_CMD = "dnf -y upgrade"
+DNF_UPGRADE_TEST_CMD = "dnf -y upgrade --setopt=tsflags=test"
 
-    upgraded_pending: Dict[str, Dict[str, str]] = {}
-    downgraded_pending: Dict[str, Dict[str, str]] = {}
-
-    if packages_altered_start is not None:
-        i = packages_altered_start
-        while i < len(lines):
-            s = lines[i].rstrip()
-            if not s:
-                i += 1
-                continue
-
-            # break on next header section
-            if re.match(
-                r"^(Transaction ID|Begin time|End time|User|Return\-Code|Releasever|Command Line|Persistence|Comment|Begin rpmdb|End rpmdb)\s*:",
-                s, re.IGNORECASE
-            ):
-                break
-
-            m = re.match(
-                r"^\s*(Install|Upgrade|Upgraded|Removed|Reinstall|Reinstalled|Downgrade|Downgraded|Reason(?:\s+Change)?)\s+(.*?)\s*(@@?\S+)?\s*$",
-                s
-            )
-            if m:
-                action = m.group(1)
-                name_ver_raw = m.group(2).strip()
-                repo = (m.group(3) or "").strip()
-
-                nm = re.match(r"^(.+?)-(\d.*)$", name_ver_raw)
-                if nm:
-                    name = nm.group(1)
-                    version = nm.group(2)
-                else:
-                    name = name_ver_raw
-                    version = ""
-
-                entry = {"action": action, "name": name, "version": version, "repo": repo}
-
-                if action == "Upgrade":
-                    upgraded_pending[name] = {"new": version}
-
-                elif action == "Upgraded":
-                    # FIXED: pairing logic + syntax
-                    old = version
-                    if name in upgraded_pending:
-                        new = upgraded_pending[name].get("new", "")
-                        tx["upgraded_pairs"].append({"name": name, "old": old, "new": new})
-                        entry["previous_version"] = old
-                        entry["new_version"] = new
-                    else:
-                        entry["previous_version"] = old
-
-                elif action == "Downgrade":
-                    downgraded_pending[name] = {"new": version}
-
-                elif action == "Downgraded":
-                    old = version
-                    if name in downgraded_pending:
-                        new = downgraded_pending[name].get("new", "")
-                        tx.setdefault("downgraded_pairs", [])
-                        tx["downgraded_pairs"].append({"name": name, "old": old, "new": new})
-                        entry["previous_version"] = old
-                        entry["new_version"] = new
-
-                tx["packages_altered"].append(entry)
-
-            i += 1
-
-    return tx
-
-def history_last(client: paramiko.SSHClient, use_sudo: bool, timeout: int,
-                 sudo_password: Optional[str], require_pty: bool) -> Dict[str, object]:
-    cmd = DNF_HISTORY_LAST_CMD
+def list_updates_dnf(client: paramiko.SSHClient, refresh: bool, use_sudo: bool, timeout: int,
+                     sudo_password: Optional[str]=None, require_pty: bool=False) -> int:
+    cmd = DNF_LIST_CMD_REFRESH if refresh else DNF_LIST_CMD_NOREFRESH
     if use_sudo:
-        ec, out, err = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout, stream=False, get_pty=require_pty)
+        ec, out, err = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout, get_pty=require_pty)
     else:
-        ec, out, err = _exec_stream(client, cmd, timeout=timeout, stream=False, get_pty=False)
+        ec, out, err = _exec_stream(client, cmd, timeout=timeout, get_pty=False)
+    if ec not in (0,100):
+        raise RuntimeError(f"dnf list --updates failed (exit={ec}): {err or out}")
+    count = len([l for l in _strip_ansi(out).splitlines() if l and not l.startswith("Updated Packages")])
+    return count
+
+def planned_upgrade_actions_dnf(client: paramiko.SSHClient, use_sudo: bool, timeout: int,
+                                sudo_password: Optional[str]=None, require_pty: bool=False) -> int:
+    cmd = DNF_UPGRADE_TEST_CMD
+    if use_sudo:
+        ec, out, err = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout, get_pty=require_pty)
+    else:
+        ec, out, err = _exec_stream(client, cmd, timeout=timeout, get_pty=False)
+    actions = 0
+    for line in _strip_ansi(out).splitlines():
+        if re.match(r"^(Upgrading|Installing|Reinstalling|Downgrading|Removing)\s", line, re.I):
+            actions += 1
+    return actions
+
+def upgrade_dnf(client: paramiko.SSHClient, use_sudo: bool, timeout: int, stream: bool,
+                sudo_password: Optional[str]=None, require_pty: bool=False) -> Tuple[str,str]:
+    cmd = DNF_UPGRADE_CMD
+    if use_sudo:
+        ec, out, err = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout, stream=stream, get_pty=require_pty)
+    else:
+        ec, out, err = _exec_stream(client, cmd, timeout=timeout, stream=stream, get_pty=False)
     if ec != 0:
-        raise RuntimeError(f"dnf history info last failed (exit={ec}): {err or out}")
-    out = _strip_ansi(out)  # strip ANSI before parsing
-    return _parse_history_info_last(out)
+        raise RuntimeError(f"dnf upgrade failed (exit={ec}): {err or out}")
+    return out, err
 
-# ----------------- changed_packages builder (common schema) -----------------
-def _build_changed_packages_from_dnf(hx: Dict[str, object]) -> List[Dict[str, str]]:
-    """
-    Build a flat 'changed_packages' array from DNF history.
-    """
-    changed: List[Dict[str, str]] = []
-    seen_upgrade = set()
-    seen_downgrade = set()
+def history_last(client: paramiko.SSHClient, use_sudo: bool=True, timeout: int=30,
+                 sudo_password: Optional[str]=None, require_pty: bool=False) -> dict:
+    cmd = "dnf history info last -q"
+    if use_sudo:
+        ec, out, err = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout, get_pty=require_pty)
+    else:
+        ec, out, err = _exec_stream(client, cmd, timeout=timeout)
+    if ec != 0:
+        raise RuntimeError("dnf history info last failed")
+    # Parse into dict
+    packages=[]
+    for line in _strip_ansi(out).splitlines():
+        m = re.match(r"^\s*(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$", line)
+        if m:
+            packages.append({"name": m.group(1), "action": m.group(2), "old_version": m.group(3),
+                             "new_version": m.group(4), "repo": ""})
+    return {"packages": packages}
 
-    # Paired upgrades (preferred over raw lines)
-    for p in hx.get("upgraded_pairs", []) or []:
+def _build_changed_packages_from_dnf(history: dict) -> List[Dict[str, str]]:
+    changed=[]
+    for pkg in history.get("packages", []):
         changed.append({
-            "action": "Upgrade",
-            "name": p.get("name", ""),
-            "old": p.get("old", ""),
-            "new": p.get("new", ""),
+            "action": pkg.get("action","Unknown"),
+            "name": pkg.get("name",""),
+            "old": pkg.get("old_version",""),
+            "new": pkg.get("new_version",""),
+            "repo": pkg.get("repo","")
         })
-        seen_upgrade.add(p.get("name", ""))
-
-    # Paired downgrades (if present)
-    for p in hx.get("downgraded_pairs", []) or []:
-        changed.append({
-            "action": "Downgrade",
-            "name": p.get("name", ""),
-            "old": p.get("old", ""),
-            "new": p.get("new", ""),
-        })
-        seen_downgrade.add(p.get("name", ""))
-
-    # Walk raw 'packages_altered' and add non-duplicated actions
-    for e in hx.get("packages_altered", []) or []:
-        action = e.get("action", "")
-        name   = e.get("name", "")
-        ver    = e.get("version", "")
-        repo   = e.get("repo", "")
-
-        if action in ("Upgrade", "Upgraded"):
-            # Skip raw lines if we already emitted paired upgrade
-            if name in seen_upgrade:
-                continue
-            if action == "Upgraded":
-                # No 'Upgrade' partner encountered; at least record 'old'
-                changed.append({"action": "Upgrade", "name": name, "old": ver})
-                seen_upgrade.add(name)
-            continue
-
-        if action in ("Downgrade", "Downgraded"):
-            if name in seen_downgrade:
-                continue
-            if action == "Downgraded":
-                changed.append({"action": "Downgrade", "name": name, "old": ver})
-                seen_downgrade.add(name)
-            continue
-
-        if action in ("Install",):
-            changed.append({"action": "Install", "name": name, "new": ver, "repo": repo})
-        elif action in ("Removed",):
-            changed.append({"action": "Removed", "name": name, "old": ver})
-        elif action in ("Reinstall", "Reinstalled"):
-            changed.append({"action": "Reinstall", "name": name, "new": ver, "repo": repo})
-        elif action in ("Reason Change", "Reason"):
-            changed.append({"action": "Reason Change", "name": name, "new": ver, "repo": repo})
-        else:
-            # keep unknown action as-is
-            changed.append({"action": action or "Unknown", "name": name, "version": ver, "repo": repo})
-
-    # Sort for readability
-    order = {"Upgrade": 0, "Install": 1, "Removed": 2, "Reinstall": 3, "Downgrade": 4, "Reason Change": 5, "Unknown": 9}
-    changed.sort(key=lambda x: (order.get(x.get("action", "Unknown"), 9), x.get("name", "")))
     return changed
 
-# ----------------- Debian/Ubuntu: apt simulation parsing & diff -----------------
+# ----------------- APT helpers -----------------
 APT_INST_RX = re.compile(r"^Inst\s+([A-Za-z0-9+_.:-]+)(?:\s+\[([^\]]+)\])?\s+\(([^)]+)\s")
 
 def _apt_normalize_name(name: str) -> str:
-    # drop optional :arch suffix for consistency with dnf schema
-    return name.split(":", 1)[0]
+    return name.split(":",1)[0]
 
-def _parse_apt_simulation(out: str) -> List[Dict[str, str]]:
-    """
-    Parse `apt-get -s dist-upgrade` and produce normalized changes:
-      Upgrade {name, old, new} or Install {name, new}
-    """
-    changes: List[Dict[str, str]] = []
-    for raw in _strip_ansi(out).splitlines():
-        line = raw.strip()
+def _parse_apt_simulation(out: str) -> List[Dict[str,str]]:
+    changes=[]
+    for line in _strip_ansi(out).splitlines():
+        line=line.strip()
         m = APT_INST_RX.match(line)
         if not m:
             continue
@@ -660,834 +140,128 @@ def _parse_apt_simulation(out: str) -> List[Dict[str, str]]:
         old = (m.group(2) or "").strip()
         new = (m.group(3) or "").strip()
         if old:
-            changes.append({"action": "Upgrade", "name": name, "old": old, "new": new})
+            changes.append({"action":"Upgrade","name":name,"old":old,"new":new,"repo":""})
         else:
-            changes.append({"action": "Install", "name": name, "new": new})
+            changes.append({"action":"Install","name":name,"old":"","new":new,"repo":""})
     return changes
 
-# ---------- APT lock-aware update (non-blocking) + single-update-per-run ----------
-APT_UPDATED_ONCE = False
+APT_UPDATED_ONCE=False
+APT_UPDATE_CMD="apt-get update -qq"
+APT_SIMULATE_UPGRADE="apt-get -s dist-upgrade"
+APT_UPGRADE_CMD="apt-get -y dist-upgrade"
 
-def _apt_wait_for_unlock(client: paramiko.SSHClient, use_sudo: bool, sudo_password: Optional[str],
-                         require_pty: bool, timeout: int) -> bool:
-    """
-    Wait (best-effort) until dpkg/apt locks are free. Returns True if free within timeout.
-    Uses *only* fuser (no lsof). Also checks apt-daily units precisely (no false match on 'inactive').
-    """
-    deadline = time.time() + max(10, min(timeout, 180))
-    check_cmd = (
-        "bash -lc '"
-        "fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || "
-        "fuser /var/lib/dpkg/lock >/dev/null 2>&1'"
-    )
-    # Query units separately to avoid substring false-positives (e.g., 'inactive' contains 'active')
-    active_cmds = [
-        "systemctl is-active apt-daily.service || true",
-        "systemctl is-active apt-daily-upgrade.service || true",
-    ]
-
-    while time.time() < deadline:
-        if use_sudo:
-            ec1, _, _ = _exec_sudo(client, check_cmd, sudo_password or "", timeout=5, stream=False, get_pty=require_pty)
-        else:
-            ec1, _, _ = _exec_stream(client, check_cmd, timeout=5, stream=False, get_pty=False)
-        if ec1 != 0:
-            # No fuser holders found; now confirm apt-daily units are not 'active'
-            is_active = False
-            for cmd in active_cmds:
-                ec2, out2, _ = _exec_stream(client, cmd, timeout=5, stream=False, get_pty=False)
-                tokens = [ln.strip() for ln in _strip_ansi(out2 or "").splitlines() if ln.strip()]
-                if any(tok == "active" for tok in tokens):
-                    is_active = True
-                    break
-            if not is_active:
-                return True
-        logger.debug("APT/dpkg busy; waiting 3s...")
-        time.sleep(3)
-
-    logger.warning("Timed out waiting for APT/dpkg locks to clear")
-    return False
-
-def _apt_update(client: paramiko.SSHClient, use_sudo: bool, sudo_password: Optional[str],
-                require_pty: bool, timeout: int) -> bool:
-    """
-    Run apt-get update once per run; return True if successful.
-    UPDATE writes /var/lib/apt/lists and /var/cache/apt, so it requires sudo/root.
-    """
+def _apt_update(client: paramiko.SSHClient, use_sudo: bool, sudo_password: Optional[str], timeout: int) -> bool:
     global APT_UPDATED_ONCE
-    if APT_UPDATED_ONCE:
-        logger.debug("Skipping apt-get update (already done this run)")
-        return True
-
-    # Wait for locks (best-effort, non-blocking check)
-    _apt_wait_for_unlock(client, use_sudo=True, sudo_password=sudo_password, require_pty=require_pty, timeout=min(timeout, 120))
-
-    # Run under bash -lc with env set inside the command; avoid PTY for apt
-    upd_cmd = (
-        "bash -lc '"
-        "export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a; "
-        + APT_UPDATE_CMD +
-        "'"
-    )
-
+    if APT_UPDATED_ONCE: return True
+    cmd = f"bash -lc 'export DEBIAN_FRONTEND=noninteractive; {APT_UPDATE_CMD}'"
     if use_sudo:
-        ec, out, err = _exec_sudo(client, upd_cmd, sudo_password or "", timeout=timeout, stream=False, get_pty=False)
+        ec, out, err = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout)
     else:
-        ec, out, err = _exec_stream(client, upd_cmd, timeout=timeout, stream=False, get_pty=False)
+        ec, out, err = _exec_stream(client, cmd, timeout=timeout)
+    APT_UPDATED_ONCE = (ec==0)
+    return APT_UPDATED_ONCE
 
-    combined = (_strip_ansi(out or "") + " " + _strip_ansi(err or ""))
-    if ec != 0:
-        logger.warning("apt-get update exit=%s; output tail: %s", ec, combined[-600:])
-        return False
+def _apt_simulate(client: paramiko.SSHClient, use_sudo: bool, sudo_password: Optional[str], timeout: int) -> List[Dict[str,str]]:
+    _apt_update(client, use_sudo, sudo_password, timeout)
+    cmd=f"bash -lc 'export DEBIAN_FRONTEND=noninteractive; {APT_SIMULATE_UPGRADE}'"
+    ec, out, err = _exec_stream(client, cmd, timeout=timeout)
+    return _parse_apt_simulation(out or "")
 
-    APT_UPDATED_ONCE = True
-    return True
-
-def _apt_simulate(client: paramiko.SSHClient, use_sudo: bool, timeout: int,
-                  sudo_password: Optional[str], require_pty: bool) -> List[Dict[str, str]]:
-    # Ensure package index is fresh — UPDATE REQUIRES SUDO
-    if not _apt_update(client, use_sudo=True, sudo_password=sudo_password, require_pty=require_pty, timeout=min(timeout, 120)):
-        raise RuntimeError("apt-get update failed or timed out before simulation")
-
-    # Simulation does not need root; still set env for consistency
-    sim_cmd = (
-        "bash -lc '"
-        "export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a; "
-        + APT_SIMULATE_UPGRADE +
-        "'"
-    )
-    ec, out, err = _exec_stream(client, sim_cmd, timeout=timeout, stream=False, get_pty=False)
-    if ec != 0 and "Inst " not in (_strip_ansi(out or "")):
-        logger.debug("APT simulate failed (exit=%s): %s", ec, _strip_ansi(err or out or "")[-600:])
-    return _parse_apt_simulation(_strip_ansi(out or ""))
-
-def _apt_upgrade(client: paramiko.SSHClient, use_sudo: bool, timeout: int, stream: bool, progress: bool,
-                 sudo_password: Optional[str], require_pty: bool) -> Tuple[str, str, int]:
-    """
-    Run apt dist-upgrade with optional streaming; return (stdout, stderr, expected_actions).
-    expected_actions is computed from pre-simulation.
-    """
-    expected = 0
-    try:
-        sim = _apt_simulate(client, use_sudo=False, timeout=min(timeout, 120), sudo_password=sudo_password, require_pty=False)
-        expected = len([c for c in sim if c.get("action") in ("Upgrade", "Install")])
-    except Exception as e:
-        logger.debug("Unable to estimate apt actions: %s", e)
-
-    # Ensure package index up to date (only once; respect locks)
-    if not _apt_update(client, use_sudo=use_sudo, sudo_password=sudo_password, require_pty=require_pty, timeout=min(timeout, 120)):
-        raise RuntimeError("apt-get update failed or timed out before upgrade")
-
-    # Run upgrade under bash -lc with env set inside; avoid PTY
-    cmd = (
-        "bash -lc '"
-        "export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a; "
-        + APT_UPGRADE_CMD +
-        "'"
-    )
+def _apt_upgrade(client: paramiko.SSHClient, use_sudo: bool, sudo_password: Optional[str], timeout: int) -> Tuple[str,str,int]:
+    before = _apt_simulate(client, use_sudo=False, sudo_password=sudo_password, timeout=timeout)
+    _apt_update(client, use_sudo, sudo_password, timeout)
+    cmd=f"bash -lc 'export DEBIAN_FRONTEND=noninteractive; {APT_UPGRADE_CMD}'"
     if use_sudo:
-        ec, out, err = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout, stream=stream, get_pty=False)
+        ec, out, err = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout)
     else:
-        ec, out, err = _exec_stream(client, cmd, timeout=timeout, stream=stream, get_pty=False)
-    if ec != 0:
-        sample = _strip_ansi((err or out or "")).strip()
-        raise RuntimeError(f"apt-get dist-upgrade failed (exit={ec}): {sample[-1000:]}")
-    logger.info("APT dist-upgrade completed successfully")
-    return out, err, expected
+        ec, out, err = _exec_stream(client, cmd, timeout=timeout)
+    after = _apt_simulate(client, use_sudo=False, sudo_password=sudo_password, timeout=timeout)
+    changed = _apt_diff_before_after(before, after)
+    return out, err, len(changed)
 
-def _apt_diff_before_after(before: List[Dict[str, str]], after: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """
-    Compute actual changes by comparing before simulation to after simulation:
-      - If a package present in 'before' is NOT present in 'after', consider it upgraded/installed.
-      - Produces normalized 'changed_packages' entries; Debian does not include Removed/Reason here.
-    """
-    after_names = {c.get("name") for c in after}
-    changed: List[Dict[str, str]] = []
-    for c in before:
-        name = c.get("name")
-        if name not in after_names:
-            action = c.get("action")
-            if action == "Upgrade":
-                changed.append({"action": "Upgrade", "name": name, "old": c.get("old", ""), "new": c.get("new", "")})
-            elif action == "Install":
-                changed.append({"action": "Install", "name": name, "new": c.get("new", "")})
-    # sort for readability
-    order = {"Upgrade": 0, "Install": 1}
-    changed.sort(key=lambda x: (order.get(x.get("action", "Upgrade"), 0), x.get("name", "")))
+def _apt_diff_before_after(before: List[Dict[str,str]], after: List[Dict[str,str]]) -> List[Dict[str,str]]:
+    changed=[]
+    after_map={p["name"]:p for p in after}
+    for b in before:
+        a = after_map.get(b["name"])
+        if a:
+            changed.append({"action":"Upgrade","name":b["name"],"old":b.get("new",""),"new":a.get("new",""),"repo":""})
+        else:
+            changed.append({"action":b.get("action","Install"),"name":b["name"],"old":"","new":b.get("new",""),"repo":""})
+    for a in after:
+        if a["name"] not in {b["name"] for b in before}:
+            changed.append({"action":"Install","name":a["name"],"old":"","new":a.get("new",""),"repo":""})
     return changed
 
-# ----------------- reboot checks (platform-aware) -----------------
-def reboot_required_rhel(client: paramiko.SSHClient, use_sudo: bool, timeout: int,
-                         sudo_password: Optional[str], require_pty: bool) -> bool:
-    check_cmd = "needs-restarting -r"
-    if use_sudo:
-        ec, out, _ = _exec_sudo(client, check_cmd, sudo_password or "", timeout=timeout, stream=False, get_pty=require_pty)
+# ----------------- Reboot checks -----------------
+def reboot_required(client: paramiko.SSHClient, platform: str, use_sudo: bool, sudo_password: Optional[str], timeout: int) -> bool:
+    if platform=="rhel":
+        cmd="needs-restarting -r"
+        if use_sudo:
+            ec, out, _ = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout)
+        else:
+            ec, out, _ = _exec_stream(client, cmd, timeout=timeout)
+        return ec==1
     else:
-        ec, out, _ = _exec_stream(client, check_cmd, timeout=timeout, stream=False, get_pty=False)
-    if ec in (0, 1):
-        need = (ec == 1)
-        logger.info("Reboot required (needs-restarting): %s", "YES" if need else "NO")
-        return need
+        cmd="[ -f /var/run/reboot-required ] && echo yes || echo no"
+        if use_sudo:
+            ec, out, _ = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout)
+        else:
+            ec, out, _ = _exec_stream(client, cmd, timeout=timeout)
+        return _strip_ansi(out).strip()=="yes"
 
-    # Fallback: kernel mismatch
-    ec_run, run_kernel, _ = _exec_stream(client, "uname -r", timeout=timeout, stream=False, get_pty=False)
-    run_kernel = _strip_ansi(run_kernel).strip() if ec_run == 0 else ""
-    ec_inst, inst_kernel, _ = (
-        _exec_sudo(client, "rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel | sort -V | tail -n1",
-                   sudo_password or "", timeout=timeout, stream=False, get_pty=require_pty)
-        if use_sudo else
-        _exec_stream(client, "rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel | sort -V | tail -n1",
-                     timeout=timeout, stream=False, get_pty=False)
-    )
-    inst_kernel = _strip_ansi(_sanitize(inst_kernel, sudo_password)).strip().strip("'") if ec_inst == 0 else ""
-    need = (inst_kernel and run_kernel and inst_kernel != run_kernel)
-    logger.info("Reboot required (kernel compare): %s (installed=%s, running=%s)", "YES" if need else "NO", inst_kernel, run_kernel)
-    return need
+# ----------------- Summary -----------------
+def _only_upgraded_pairs(changed: List[Dict[str,str]]) -> List[Dict[str,str]]:
+    return sorted([c for c in changed if c.get("action")=="Upgrade" and c.get("old") and c.get("new")], key=lambda x:x["name"])
 
-def reboot_required_debian(client: paramiko.SSHClient, use_sudo: bool, timeout: int,
-                           sudo_password: Optional[str], require_pty: bool) -> bool:
-    # Primary: presence of /var/run/reboot-required
-    cmd = "[ -f /var/run/reboot-required ] && echo yes || echo no"
-    if use_sudo:
-        ec, out, _ = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout, stream=False, get_pty=require_pty)
-    else:
-        ec, out, _ = _exec_stream(client, cmd, timeout=timeout, stream=False, get_pty=False)
-    if (ec == 0 and _strip_ansi(out).strip() == "yes"):
-        logger.info("Reboot required (/var/run/reboot-required): YES")
-        return True
-
-    # Fallback: compare latest installed kernel image vs running
-    ec_run, run_kernel, _ = _exec_stream(client, "uname -r", timeout=timeout, stream=False, get_pty=False)
-    run_kernel = _strip_ansi(run_kernel).strip() if ec_run == 0 else ""
-    ec_inst, inst_kernel, _ = _exec_stream(
-        client,
-        "ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's#/boot/vmlinuz-##' | sort -V | tail -n1",
-        timeout=timeout, stream=False, get_pty=False
-    )
-    inst_kernel = _strip_ansi(inst_kernel).strip()
-    need = (inst_kernel and run_kernel and inst_kernel != run_kernel)
-    logger.info("Reboot required (kernel compare): %s (installed=%s, running=%s)", "YES" if need else "NO", inst_kernel, run_kernel)
-    return need
-
-def explain_reboot_rhel(client: paramiko.SSHClient, use_sudo: bool, timeout: int,
-                        sudo_password: Optional[str], require_pty: bool) -> Dict[str, object]:
-    info: Dict[str, object] = {"kernel_mismatch": False, "installed_kernel": "", "running_kernel": "", "services_needing_restart": []}
-
-    ec_run, run_kernel, _ = _exec_stream(client, "uname -r", timeout=timeout, stream=False, get_pty=False)
-    ec_inst, inst_kernel, _ = (
-        _exec_sudo(client, "rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel | sort -V | tail -n1",
-                   sudo_password or "", timeout=timeout, stream=False, get_pty=require_pty)
-        if use_sudo else
-        _exec_stream(client, "rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel | sort -V | tail -n1",
-                     timeout=timeout, stream=False, get_pty=False)
-    )
-    inst_kernel = _strip_ansi(_sanitize(inst_kernel, sudo_password)).strip().strip("'")
-    run_kernel = _strip_ansi(run_kernel).strip() if ec_run == 0 else "unknown"
-    info["running_kernel"] = run_kernel
-    info["installed_kernel"] = inst_kernel
-    info["kernel_mismatch"] = (run_kernel != inst_kernel) if (run_kernel and inst_kernel) else False
-
-    cmd = "needs-restarting -s"
-    if use_sudo:
-        ec, out, _ = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout, stream=False, get_pty=require_pty)
-    else:
-        ec, out, _ = _exec_stream(client, cmd, timeout=timeout, stream=False, get_pty=False)
-    services: List[str] = []
-    if ec == 0 and out.strip():
-        for line in _strip_ansi(_sanitize(out, sudo_password)).splitlines():
-            s = line.strip()
-            if s and not any(s.startswith(p) for p in NOISE_PREFIXES):
-                services.append(s)
-    info["services_needing_restart"] = services
-    return info
-
-def explain_reboot_debian(client: paramiko.SSHClient, timeout: int) -> Dict[str, object]:
-    info: Dict[str, object] = {"kernel_mismatch": False, "installed_kernel": "", "running_kernel": "", "services_needing_restart": []}
-    ec_run, run_kernel, _ = _exec_stream(client, "uname -r", timeout=timeout, stream=False, get_pty=False)
-    ec_inst, inst_kernel, _ = _exec_stream(
-        client,
-        "ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's#/boot/vmlinuz-##' | sort -V | tail -n1",
-        timeout=timeout, stream=False, get_pty=False
-    )
-    run_kernel = _strip_ansi(run_kernel).strip() if ec_run == 0 else "unknown"
-    inst_kernel = _strip_ansi(inst_kernel).strip()
-    info["running_kernel"] = run_kernel
-    info["installed_kernel"] = inst_kernel
-    info["kernel_mismatch"] = (run_kernel != inst_kernel) if (run_kernel and inst_kernel) else False
-    # Debian: no direct equivalent to needs-restarting -s; leave empty
-    info["services_needing_restart"] = []
-    return info
-
-# ----------------- helpers for minimal summary -----------------
-def _only_upgraded_pairs(changed: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """
-    Return only records where action == 'Upgrade' and both old and new are present.
-    Used only for counting in the summary.
-    """
-    out: List[Dict[str, str]] = []
-    for e in changed:
-        if e.get("action") == "Upgrade" and e.get("old") and e.get("new"):
-            out.append({"name": e.get("name",""), "old": e.get("old",""), "new": e.get("new","")})
-    out.sort(key=lambda x: x.get("name",""))
-    return out
-
-def _print_summary(changed_packages: List[Dict[str, str]],
-                   reboot_performed: bool,
-                   post_checks: Dict,
-                   fmt: str = "text") -> None:
-    """
-    Print only short summary to stdout:
-      - number of upgraded packages (paired old->new)
-      - whether server was successfully rebooted
-    """
-    upgraded_only = _only_upgraded_pairs(changed_packages)
-
-    # Success definition:
-    #   reboot_performed == True AND post_checks has non-empty data AND system state == "running"
-    #   fallback: kernel matches latest
-    reboot_success = False
-    if reboot_performed and post_checks:
-        state = str(post_checks.get("system_state", "")).strip().lower()
-        reboot_success = (state == "running")
-        if not reboot_success:
-            reboot_success = bool(post_checks.get("kernel_matches_latest", False))
-
-    summary = {
-        "upgraded_count": len(upgraded_only),
-        "reboot_performed": bool(reboot_performed),
-        "reboot_success": bool(reboot_success)
-    }
-
-    if fmt == "json":
+def _print_summary(changed_packages: List[Dict[str,str]], reboot_performed: bool, fmt="text"):
+    upgraded = _only_upgraded_pairs(changed_packages)
+    summary = {"upgraded_count": len(upgraded), "reboot_performed": reboot_performed, "reboot_success": reboot_performed}
+    if fmt=="json":
         print(json.dumps(summary))
     else:
-        print(f"Upgraded packages: {summary['upgraded_count']} | "
-              f"Reboot performed: {'YES' if summary['reboot_performed'] else 'NO'} | "
-              f"Reboot success: {'YES' if summary['reboot_success'] else 'NO'}")
+        print(f"Upgraded packages: {summary['upgraded_count']} | Reboot performed: {'YES' if reboot_performed else 'NO'}")
 
-# ----------------- core ops: list, planned, upgrade, reboot (RHEL/OL) -----------------
-def list_updates_dnf(client: paramiko.SSHClient, refresh: bool, use_sudo: bool, timeout: int,
-                     sudo_password: Optional[str]=None, require_pty: bool=False, validate: bool=True) -> int:
-    cmd = DNF_LIST_CMD_REFRESH if refresh else DNF_LIST_CMD_NOREFRESH
-    if use_sudo:
-        ec, out, err = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout, stream=False, get_pty=require_pty)
-    else:
-        ec, out, err = _exec_stream(client, cmd, timeout=timeout, stream=False, get_pty=False)
-    if ec not in (0, 100):
-        raise RuntimeError(f"dnf list --updates failed (exit={ec}): {err or out}")
-    raw = _count_packages_from_list_output(out)
-    logger.info("Raw list --updates count: %d", raw)
-    return _post_validate_count(raw, client, use_sudo, timeout, sudo_password, require_pty) if validate else raw
-
-def planned_upgrade_actions_dnf(client: paramiko.SSHClient, use_sudo: bool, timeout: int,
-                                sudo_password: Optional[str]=None, require_pty: bool=False) -> int:
-    cmd = DNF_UPGRADE_TEST_CMD
-    if use_sudo:
-        ec, out, err = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout, stream=False, get_pty=require_pty)
-    else:
-        ec, out, err = _exec_stream(client, cmd, timeout=timeout, stream=False, get_pty=False)
-    if ec != 0:
-        raise RuntimeError(f"dnf upgrade --setopt=tsflags=test failed (exit={ec}): {err or out}")
-    actions = 0
-    for raw in _strip_ansi(out).splitlines():
-        line = raw.strip()
-        if re.match(r"^(Upgrading|Installing|Reinstalling|Downgrading|Removing)\s", line, flags=re.IGNORECASE):
-            actions += 1
-    logger.info("Planned actions (simulation): %d", actions)
-    return actions
-
-def upgrade_dnf(client: paramiko.SSHClient, use_sudo: bool, timeout: int, stream: bool, progress: bool,
-                sudo_password: Optional[str]=None, require_pty: bool=False) -> Tuple[str, str]:
-    if progress:
-        try:
-            _ = planned_upgrade_actions_dnf(client, use_sudo=use_sudo, timeout=min(timeout, 120),
-                                            sudo_password=sudo_password, require_pty=require_pty)
-        except Exception as e:
-            logger.warning("Unable to estimate actions for progress: %s", e)
-
-    cmd = DNF_UPGRADE_CMD
-    if use_sudo:
-        ec, out, err = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout,
-                                  stream=stream, get_pty=require_pty)
-    else:
-        ec, out, err = _exec_stream(client, cmd, timeout=timeout, stream=stream, get_pty=False)
-    if ec != 0:
-        raise RuntimeError(f"dnf upgrade failed (exit={ec}): {err or out}")
-    logger.info("DNF upgrade completed successfully")
-    return out, err
-
-# ----------------- core ops: list/upgrade (Debian/Ubuntu) -----------------
-def list_updates_apt(client: paramiko.SSHClient, use_sudo: bool, timeout: int,
-                     sudo_password: Optional[str]=None, require_pty: bool=False) -> int:
-    sim = _apt_simulate(client, use_sudo=use_sudo, timeout=timeout,
-                        sudo_password=sudo_password, require_pty=require_pty)
-    count = len([c for c in sim if c.get("action") in ("Upgrade", "Install")])
-    logger.info("APT upgradable count (simulation): %d", count)
-    return count
-
-# ----------------- system readiness and post-reboot checks -----------------
-def _wait_system_ready(client: paramiko.SSHClient, timeout: int) -> None:
-    """Poll systemd state briefly to avoid racing right after boot."""
-    end = time.time() + min(60, max(10, timeout))  # up to 60s
-    while time.time() < end:
-        ec, out, _ = _exec_stream(client, "systemctl is-system-running", timeout=5, stream=False, get_pty=False)
-        state = _strip_ansi(out or "").strip().lower()
-        # Acceptable steady states
-        if ec == 0 and state in ("running", "degraded"):
-            return
-        time.sleep(3)
-
-def post_reboot_checks_common(client: paramiko.SSHClient, use_sudo: bool, timeout: int,
-                              sudo_password: Optional[str]=None, require_pty: bool=False) -> dict:
-    # Optional readiness check (best-effort)
-    try:
-        _wait_system_ready(client, timeout)
-    except Exception:
-        logger.debug("Systemd readiness wait skipped or failed; continuing with checks")
-
-    checks = {}
-    cmd = "systemctl is-system-running"
-    if use_sudo:
-        ec, out, _ = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout, stream=False, get_pty=require_pty)
-    else:
-        ec, out, _ = _exec_stream(client, cmd, timeout=timeout, stream=False, get_pty=False)
-    checks["system_state"] = _strip_ansi(_sanitize(out, sudo_password)).strip() if ec == 0 else "unknown"
-
-    ec, out, _ = _exec_stream(client, "who -b | awk '{print $3\" \"$4}'", timeout=timeout, stream=False, get_pty=False)
-    checks["last_boot"] = _strip_ansi(out).strip() if ec == 0 else "unknown"
-
-    ec_run, run_kernel, _ = _exec_stream(client, "uname -r", timeout=timeout, stream=False, get_pty=False)
-    run_kernel = _strip_ansi(run_kernel).strip() if ec_run == 0 else "unknown"
-
-    # best-effort "installed latest kernel"
-    ec_inst_rhel, inst_kernel_rhel, _ = _exec_stream(client, "rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel 2>/dev/null | sort -V | tail -n1",
-                                                     timeout=timeout, stream=False, get_pty=False)
-    ec_inst_deb, inst_kernel_deb, _ = _exec_stream(client, "ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's#/boot/vmlinuz-##' | sort -V | tail -n1",
-                                                   timeout=timeout, stream=False, get_pty=False)
-    inst_kernel = _strip_ansi(inst_kernel_rhel if ec_inst_rhel == 0 else inst_kernel_deb).strip() or "unknown"
-
-    checks["kernel_running"] = run_kernel
-    checks["kernel_installed_latest"] = inst_kernel
-    checks["kernel_matches_latest"] = (run_kernel == inst_kernel) if (run_kernel != "unknown" and inst_kernel != "unknown") else False
-
-    # Remaining updates (platform-neutral attempt)
-    try:
-        rem = list_updates_dnf(client, refresh=True, use_sudo=use_sudo, timeout=timeout,
-                               sudo_password=sudo_password, require_pty=require_pty, validate=True)
-        checks["updates_remaining"] = rem
-    except Exception:
-        try:
-            rem = list_updates_apt(client, use_sudo=use_sudo, timeout=timeout,
-                                   sudo_password=sudo_password, require_pty=require_pty)
-            checks["updates_remaining"] = rem
-        except Exception:
-            checks["updates_remaining"] = -1
-    return checks
-
-# ----------------- reporting -----------------
-def write_report(path: str, report: dict) -> None:
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
-        logger.info("Report written to %s", path)
-    except Exception as e:
-        logger.error("Failed to write report to %s: %s", path, e)
-
-# ----------------- CLI -----------------
+# ----------------- Main CLI -----------------
 def main():
-    parser = argparse.ArgumentParser(
-        description="Check and optionally apply Linux (dnf/apt) updates over SSH."
-    )
-    parser.add_argument("host", help="Server hostname or IP")
-    parser.add_argument("username", help="SSH username")
-    parser.add_argument("password", help="SSH password")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("host"); parser.add_argument("username"); parser.add_argument("password")
+    parser.add_argument("--port",type=int,default=22); parser.add_argument("--timeout",type=int,default=30)
+    parser.add_argument("--upgrade-timeout",type=int,default=1800)
+    parser.add_argument("--sudo",action="store_true"); parser.add_argument("--upgrade",action="store_true")
+    parser.add_argument("--dry-run",action="store_true")
+    parser.add_argument("--reboot",action="store_true")
+    parser.add_argument("--summary-only",action="store_true")
+    parser.add_argument("--json",action="store_true")
+    args=parser.parse_args()
 
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--timeout", type=int, default=30, help="Timeout seconds for list/check commands")
-    parser.add_argument("--upgrade-timeout", type=int, default=1800, help="Timeout seconds for the upgrade step (default: 1800)")
-    parser.add_argument("--no-refresh", action="store_true", help="Do not refresh DNF metadata for the listing step (RHEL/OL only)")
-    parser.add_argument("--sudo", action="store_true", help="Force running remote commands with sudo (auto-enabled if not root)")
-    parser.add_argument("--pty", action="store_true", help="Request a PTY for remote commands (helps when sudo requires tty)")
-    parser.add_argument("--stream", action="store_true", help="Stream remote stdout/stderr during upgrade")
-    parser.add_argument("--progress", action="store_true", help="Show best-effort percentage during upgrade")
-
-    parser.add_argument("--upgrade", action="store_true", help="Perform upgrade before counting updates")
-    parser.add_argument("--dry-run", action="store_true", help="Simulate upgrade (dnf: tsflags=test; apt: -s) and show planned actions")
-    parser.add_argument("--reboot", action="store_true", help="If reboot is required, initiate it after checks/upgrade")
-    parser.add_argument("--reboot-wait", type=int, default=300, help="Seconds to wait for host to return after reboot (default: 300)")
-    parser.add_argument("--explain-reboot", action="store_true", help="If reboot is required, show reasons (kernel mismatch/services for RHEL/OL)")
-
-    parser.add_argument("--history-only", action="store_true",
-                        help="Do not upgrade; just read and report last changes (dnf history or apt simulation/diff)")
-
-    parser.add_argument("--report-file", help="Write a JSON report to this path with host info, timestamps, and Packages Altered")
-
-    parser.add_argument("--json", action="store_true", help="Output result as JSON")
-    parser.add_argument("-v", "--verbose", action="count", default=0, help="Increase verbosity (use -vv for debug)")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-
-    # File export + minimal summary controls
-    parser.add_argument(
-        "--changed-packages-file",
-        help="Write ALL normalized 'Packages Altered' to this JSON file"
-    )
-    parser.add_argument(
-        "--summary-only",
-        action="store_true",
-        help="Print only a short summary to stdout (count of upgraded pkgs and reboot success)"
-    )
-    parser.add_argument(
-        "--summary-format",
-        choices=["text", "json"],
-        default="text",
-        help="Format of the short summary when --summary-only is used (default: text)"
-    )
-
-    args = parser.parse_args()
-    build_logger(args.verbose, args.debug)
-
-    # Connect
-    try:
-        client = connect(args.host, args.username, args.password, args.port, args.timeout)
-    except Exception as e:
-        print(f"Error: SSH connect failed: {e}", file=sys.stderr)
-        sys.exit(2)
-
-    # Auto-detect root, decide sudo usage
+    client = connect(args.host, args.username, args.password, args.port, args.timeout)
     session_is_root = is_root(client)
-    use_sudo = args.sudo or (not session_is_root)
-    require_pty = args.pty or use_sudo  # conservative
-    logger.info("Session is root: %s | Using sudo: %s | PTY: %s",
-                "YES" if session_is_root else "NO",
-                "YES" if use_sudo else "NO",
-                "YES" if require_pty else "NO")
+    use_sudo = args.sudo or not session_is_root
 
-    # Platform detection
     platform = detect_platform(client)
-    if platform == "unknown":
-        print("Error: Unsupported or unknown Linux distribution (os-release ID).", file=sys.stderr)
-        try:
-            client.close()
-        except Exception:
-            pass
-        sys.exit(2)
-    logger.info("Detected platform: %s", platform.upper())
+    report = {"changed_packages":[]}
 
-    # Host info & start timestamps
-    hostinfo = _host_info(client)
-    remote_started = _remote_time_iso(client)
-    local_started = datetime.now(timezone.utc).isoformat()
-
-    # Base report
-    report: Dict[str, object] = {
-        "host": hostinfo,
-        "run": {
-            "local_started": local_started,
-            "remote_started": remote_started,
-            "local_ended": None,
-            "remote_ended": None,
-            "upgraded": False,
-            "reboot_requested": bool(args.reboot),
-            "reboot_performed": False
-        },
-        "pre": {},
-        "post": {},
-        "history": {},
-        "changed_packages": []  # always included
-    }
-
-    # History-only mode
-    if args.history_only:
-        try:
-            if platform == "rhel":
-                hx = history_last(client, use_sudo=use_sudo, timeout=args.timeout,
-                                  sudo_password=args.password, require_pty=require_pty)
-                report["history"] = hx
-                cp = _build_changed_packages_from_dnf(hx)
-            else:
-                # Debian/Ubuntu: simulate planned changes; no authoritative history
-                before_sim = _apt_simulate(client, use_sudo=False, timeout=args.timeout,
-                                           sudo_password=args.password, require_pty=False)
-                report["history"] = {"apt_simulation": before_sim}
-                cp = before_sim  # planned changes
-
-            report["changed_packages"] = cp
-            report.setdefault("history", {})["changed_packages"] = cp
-
-            # Export file
-            try:
-                if args.changed_packages_file:
-                    with open(args.changed_packages_file, "w", encoding="utf-8") as f:
-                        json.dump(cp, f, ensure_ascii=False, indent=2)
-                    logger.info("All normalized 'Packages Altered' written to %s", args.changed_packages_file)
-            except Exception as e:
-                logger.error("Failed to write changed-packages file: %s", e)
-
-            report["run"]["local_ended"] = datetime.now(timezone.utc).isoformat()
-            report["run"]["remote_ended"] = _remote_time_iso(client)
-
-            if args.report_file:
-                write_report(args.report_file, report)
-
-            if args.summary_only:
-                _print_summary(report.get("history", {}).get("changed_packages", []),
-                               reboot_performed=False,
-                               post_checks={},
-                               fmt=args.summary_format)
-            else:
-                print(json.dumps(report, indent=2) if not args.json else json.dumps(report))
-
-            try:
-                client.close()
-            except Exception:
-                pass
-            sys.exit(0)
-        except Exception as e:
-            print(f"Error: reading history/simulation failed: {e}", file=sys.stderr)
-            try:
-                client.close()
-            except Exception:
-                pass
-            sys.exit(2)
-
-    # Pre-check (with validation)
-    try:
-        if platform == "rhel":
-            pre_count = list_updates_dnf(client, refresh=not args.no_refresh, use_sudo=use_sudo,
-                                         timeout=args.timeout, sudo_password=args.password,
-                                         require_pty=require_pty, validate=True)
-        else:
-            pre_count = list_updates_apt(client, use_sudo=use_sudo, timeout=args.timeout,
-                                         sudo_password=args.password, require_pty=require_pty)
-        report["pre"] = {"updates_available": pre_count}
-    except Exception as e:
-        if platform == "debian":
-            logger.warning("APT listing had an issue (%s); treating as 0 updates.", e)
-            report["pre"] = {"updates_available": 0}
-        else:
-            print(f"Error: failed to list updates: {e}", file=sys.stderr)
-            try:
-                client.close()
-            except Exception:
-                pass
-            sys.exit(2)
-
-    # DRY RUN: simulate and exit
-    if args.dry_run:
-        try:
-            if platform == "rhel":
-                actions = planned_upgrade_actions_dnf(client, use_sudo=use_sudo, timeout=min(args.timeout, 120),
-                                                      sudo_password=args.password, require_pty=require_pty)
-                report.setdefault("history", {})
-                report["changed_packages"] = []
-                report["history"]["changed_packages"] = []
-            else:
-                sim = _apt_simulate(client, use_sudo=False, timeout=min(args.timeout, 120),
-                                    sudo_password=args.password, require_pty=False)
-                actions = len([c for c in sim if c.get("action") in ("Upgrade", "Install")])
-                report.setdefault("history", {})["apt_simulation"] = sim
-                report["changed_packages"] = sim
-                report["history"]["changed_packages"] = sim
-
-            report["run"]["upgraded"] = False
-            report["post"] = {"updates_available": report["pre"]["updates_available"]}
-            report["run"]["local_ended"] = datetime.now(timezone.utc).isoformat()
-            report["run"]["remote_ended"] = _remote_time_iso(client)
-
-            if args.report_file:
-                write_report(args.report_file, report)
-
-            if args.summary_only:
-                _print_summary(report.get("history", {}).get("changed_packages", []),
-                               reboot_performed=False,
-                               post_checks={},
-                               fmt=args.summary_format)
-            else:
-                print(json.dumps(report, indent=2) if not args.json else json.dumps(report))
-
-            try:
-                client.close()
-            except Exception:
-                pass
-            sys.exit(0)
-        except Exception as e:
-            print(f"Error: dry-run simulation failed: {e}", file=sys.stderr)
-            try:
-                client.close()
-            except Exception:
-                pass
-            sys.exit(2)
-
-    # Real upgrade if requested (do not gate on pre-count; pre-check can be stale/timed out)
-    before_sim_apt: List[Dict[str, str]] = []
-    if args.upgrade:
-        logger.info("Starting upgrade (pre_count=%s)", report["pre"].get("updates_available"))
-        try:
-            if platform == "rhel":
-                _upgrade_stdout, _upgrade_stderr = upgrade_dnf(
-                    client, use_sudo=use_sudo, timeout=args.upgrade_timeout,
-                    stream=(args.stream or args.progress), progress=args.progress,
-                    sudo_password=args.password, require_pty=require_pty
-                )
-            else:
-                # Debian/Ubuntu: capture pre-simulation for diff, then upgrade
-                before_sim_apt = _apt_simulate(client, use_sudo=False, timeout=min(args.timeout, 120),
-                                               sudo_password=args.password, require_pty=False)
-                _out, _err, _exp = _apt_upgrade(
-                    client, use_sudo=use_sudo, timeout=args.upgrade_timeout,
-                    stream=(args.stream or args.progress), progress=args.progress,
-                    sudo_password=args.password, require_pty=require_pty
-                )
-            report["run"]["upgraded"] = True
-        except Exception as e:
-            print(f"Error: upgrade failed: {e}", file=sys.stderr)
-            report["run"]["local_ended"] = datetime.now(timezone.utc).isoformat()
-            report["run"]["remote_ended"] = _remote_time_iso(client)
-            if args.report_file:
-                write_report(args.report_file, report)
-            try:
-                client.close()
-            except Exception:
-                pass
-            sys.exit(2)
-
-    # Authoritative history / changes
-    try:
-        if platform == "rhel":
-            hx = history_last(client, use_sudo=use_sudo, timeout=args.timeout,
-                              sudo_password=args.password, require_pty=require_pty)
-            report["history"] = hx
-            cp = _build_changed_packages_from_dnf(hx)
-        else:
-            # Debian: diff before and after simulation to compute actual changes
-            after_sim_apt = _apt_simulate(client, use_sudo=False, timeout=args.timeout,
-                                          sudo_password=args.password, require_pty=False)
-            cp = _apt_diff_before_after(before_sim_apt, after_sim_apt)
-            report["history"] = {
-                "apt_simulation_before": before_sim_apt,
-                "apt_simulation_after": after_sim_apt
-            }
-        report["changed_packages"] = cp
-        report.setdefault("history", {})["changed_packages"] = cp
-
-        # Write ALL normalized 'Packages Altered' to file if requested
-        try:
-            if args.changed_packages_file:
-                with open(args.changed_packages_file, "w", encoding="utf-8") as f:
-                    json.dump(cp, f, ensure_ascii=False, indent=2)
-                logger.info("All normalized 'Packages Altered' written to %s", args.changed_packages_file)
-        except Exception as e:
-            logger.error("Failed to write changed-packages file: %s", e)
-
-    except Exception as e:
-        logger.warning("Unable to compute changes: %s", e)
-        report["changed_packages"] = []
-        report.setdefault("history", {})["changed_packages"] = []
-
-    # Post-upgrade re-count
-    post_count = report["pre"]["updates_available"]
-    try:
-        if platform == "rhel":
-            post_count = list_updates_dnf(client, refresh=True, use_sudo=use_sudo, timeout=args.timeout,
-                                          sudo_password=args.password, require_pty=require_pty, validate=True)
-        else:
-            post_count = list_updates_apt(client, use_sudo=use_sudo, timeout=args.timeout,
-                                          sudo_password=args.password, require_pty=require_pty)
-    except Exception as e:
-        logger.warning("Failed to re-list updates after upgrade: %s", e)
-    report.setdefault("post", {})["updates_available"] = post_count
-
-    # Reboot check
-    try:
-        need_reboot = reboot_required_rhel(client, use_sudo=use_sudo, timeout=args.timeout,
-                                           sudo_password=args.password, require_pty=require_pty) if platform == "rhel" \
-                     else reboot_required_debian(client, use_sudo=use_sudo, timeout=args.timeout,
-                                                 sudo_password=args.password, require_pty=require_pty)
-        report.setdefault("post", {})["reboot_required"] = bool(need_reboot)
-        if need_reboot and args.explain_reboot:
-            exp = explain_reboot_rhel(client, use_sudo=use_sudo, timeout=args.timeout,
-                                      sudo_password=args.password, require_pty=require_pty) if platform == "rhel" \
-                else explain_reboot_debian(client, timeout=args.timeout)
-            report["post"]["reboot_explanation"] = exp
-    except Exception as e:
-        logger.warning("Reboot check failed: %s", e)
-        report.setdefault("post", {})["reboot_required"] = False
-
-    # Reboot if requested & needed
-    if args.reboot and report["post"]["reboot_required"]:
-        try:
-            cmd = "systemctl reboot --message 'Post-upgrade reboot via check_upgrades.py'"
-            if use_sudo:
-                _exec_sudo(client, cmd, args.password or "", timeout=10, stream=False, get_pty=require_pty)
-            else:
-                _exec_stream(client, cmd, timeout=10, stream=False, get_pty=False)
-            report["run"]["reboot_performed"] = True
-        except Exception as e:
-            logger.debug("Reboot trigger error (expected if connection drops): %s", e)
-        try:
-            client.close()
-        except Exception:
-            pass
-
-        client = wait_for_reconnect(args.host, args.username, args.password, args.port, args.reboot_wait)
-        if client:
-            try:
-                checks = post_reboot_checks_common(client, use_sudo=use_sudo, timeout=args.timeout,
-                                                   sudo_password=args.password, require_pty=require_pty)
-                report.setdefault("post", {})["post_reboot_checks"] = checks
-                report["run"]["local_ended"] = datetime.now(timezone.utc).isoformat()
-                report["run"]["remote_ended"] = _remote_time_iso(client)
-                if args.report_file:
-                    write_report(args.report_file, report)
-
-                if args.summary_only:
-                    _print_summary(report.get("history", {}).get("changed_packages", []),
-                                   reboot_performed=report["run"].get("reboot_performed", False),
-                                   post_checks=report.get("post", {}).get("post_reboot_checks", {}),
-                                   fmt=args.summary_format)
-                else:
-                    print(json.dumps(report, indent=2) if not args.json else json.dumps(report))
-
-                try:
-                    client.close()
-                except Exception:
-                    pass
-                sys.exit(0)
-            except Exception as e:
-                report["run"]["local_ended"] = datetime.now(timezone.utc).isoformat()
-                report["run"]["remote_ended"] = report["run"]["remote_ended"] or report["run"]["local_ended"]
-                if args.report_file:
-                    write_report(args.report_file, report)
-                print(f"Error: post‑reboot checks failed: {e}", file=sys.stderr)
-                sys.exit(2)
-        else:
-            report["run"]["local_ended"] = datetime.now(timezone.utc).isoformat()
-            report["run"]["remote_ended"] = report["run"]["remote_ended"] or report["run"]["local_ended"]
-            if args.report_file:
-                write_report(args.report_file, report)
-            print("Error: host did not return after reboot within the wait window.", file=sys.stderr)
-            sys.exit(2)
+    if platform=="rhel":
+        if args.dry_run:
+            _ = planned_upgrade_actions_dnf(client, use_sudo, args.timeout)
+        hx = history_last(client, use_sudo, args.timeout, args.password)
+        report["changed_packages"] = _build_changed_packages_from_dnf(hx)
+        if args.upgrade:
+            upgrade_dnf(client, use_sudo, args.upgrade_timeout, stream=False, sudo_password=args.password)
     else:
-        # No reboot performed
-        report["run"]["reboot_performed"] = False
-        report["run"]["local_ended"] = datetime.now(timezone.utc).isoformat()
-        report["run"]["remote_ended"] = _remote_time_iso(client)
-        if args.report_file:
-            write_report(args.report_file, report)
+        before = _apt_simulate(client, use_sudo=False, sudo_password=args.password, timeout=args.timeout)
+        if args.upgrade:
+            _apt_upgrade(client, use_sudo, sudo_password=args.password, timeout=args.upgrade_timeout)
+        after = _apt_simulate(client, use_sudo=False, sudo_password=args.password, timeout=args.timeout)
+        report["changed_packages"] = _apt_diff_before_after(before, after)
 
-        if args.summary_only:
-            _print_summary(report.get("history", {}).get("changed_packages", []),
-                           reboot_performed=False,
-                           post_checks={},
-                           fmt=args.summary_format)
-        else:
-            print(json.dumps(report, indent=2) if not args.json else json.dumps(report))
+    reboot_needed = reboot_required(client, platform, use_sudo, args.password, args.timeout)
 
-        try:
-            client.close()
-        except Exception:
-            pass
-        sys.exit(0)
+    if args.summary_only:
+        _print_summary(report["changed_packages"], reboot_performed=reboot_needed, fmt="json" if args.json else "text")
+    else:
+        print(json.dumps(report, indent=2) if not args.json else json.dumps(report))
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
