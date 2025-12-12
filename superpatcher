@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import paramiko, re, time, json, sys
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 
 # ----------------- Utilities -----------------
@@ -19,7 +19,13 @@ def _exec_stream(client: paramiko.SSHClient, cmd: str, timeout: int=30,
 def _exec_sudo(client: paramiko.SSHClient, cmd: str, sudo_password: str,
                timeout: int=30, stream: bool=False, get_pty: bool=False) -> Tuple[int,str,str]:
     full_cmd = f"sudo -S -p '' {cmd}"
-    ec, out, err = _exec_stream(client, full_cmd, timeout=timeout, stream=stream, get_pty=get_pty)
+    stdin, stdout, stderr = client.exec_command(full_cmd, get_pty=get_pty, timeout=timeout)
+    if sudo_password:
+        stdin.write(sudo_password + "\n")
+        stdin.flush()
+    out = stdout.read().decode()
+    err = stderr.read().decode()
+    ec = stdout.channel.recv_exit_status()
     return ec, out, err
 
 def is_root(client: paramiko.SSHClient) -> bool:
@@ -39,10 +45,6 @@ def connect(host: str, user: str, password: str, port: int, timeout: int) -> par
     client.connect(hostname=host, username=user, password=password, port=port, timeout=timeout)
     return client
 
-def _remote_time_iso(client: paramiko.SSHClient) -> str:
-    ec, out, _ = _exec_stream(client, "date -u +%Y-%m-%dT%H:%M:%SZ")
-    return out.strip() if ec==0 else datetime.utcnow().isoformat()+'Z'
-
 def _host_info(client: paramiko.SSHClient) -> dict:
     info = {}
     ec, out, _ = _exec_stream(client, "hostname")
@@ -50,6 +52,10 @@ def _host_info(client: paramiko.SSHClient) -> dict:
     ec, out, _ = _exec_stream(client, "uname -r")
     info["kernel"] = out.strip() if ec==0 else "unknown"
     return info
+
+def _remote_time_iso(client: paramiko.SSHClient) -> str:
+    ec, out, _ = _exec_stream(client, "date -u +%Y-%m-%dT%H:%M:%SZ")
+    return out.strip() if ec==0 else datetime.utcnow().isoformat()+'Z'
 
 # ----------------- DNF helpers -----------------
 DNF_LIST_CMD_NOREFRESH = "dnf list --updates"
@@ -146,14 +152,11 @@ def _parse_apt_simulation(out: str) -> List[Dict[str,str]]:
     return changes
 
 APT_UPDATED_ONCE=False
-APT_UPDATE_CMD="apt-get update -qq"
-APT_SIMULATE_UPGRADE="apt-get -s dist-upgrade"
-APT_UPGRADE_CMD="apt-get -y dist-upgrade"
 
 def _apt_update(client: paramiko.SSHClient, use_sudo: bool, sudo_password: Optional[str], timeout: int) -> bool:
     global APT_UPDATED_ONCE
     if APT_UPDATED_ONCE: return True
-    cmd = f"bash -lc 'export DEBIAN_FRONTEND=noninteractive; {APT_UPDATE_CMD}'"
+    cmd = f"export DEBIAN_FRONTEND=noninteractive; apt-get update -qq"
     if use_sudo:
         ec, out, err = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout)
     else:
@@ -163,19 +166,22 @@ def _apt_update(client: paramiko.SSHClient, use_sudo: bool, sudo_password: Optio
 
 def _apt_simulate(client: paramiko.SSHClient, use_sudo: bool, sudo_password: Optional[str], timeout: int) -> List[Dict[str,str]]:
     _apt_update(client, use_sudo, sudo_password, timeout)
-    cmd=f"bash -lc 'export DEBIAN_FRONTEND=noninteractive; {APT_SIMULATE_UPGRADE}'"
-    ec, out, err = _exec_stream(client, cmd, timeout=timeout)
-    return _parse_apt_simulation(out or "")
-
-def _apt_upgrade(client: paramiko.SSHClient, use_sudo: bool, sudo_password: Optional[str], timeout: int) -> Tuple[str,str,int]:
-    before = _apt_simulate(client, use_sudo=False, sudo_password=sudo_password, timeout=timeout)
-    _apt_update(client, use_sudo, sudo_password, timeout)
-    cmd=f"bash -lc 'export DEBIAN_FRONTEND=noninteractive; {APT_UPGRADE_CMD}'"
+    cmd=f"export DEBIAN_FRONTEND=noninteractive; apt-get -s dist-upgrade"
     if use_sudo:
         ec, out, err = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout)
     else:
         ec, out, err = _exec_stream(client, cmd, timeout=timeout)
-    after = _apt_simulate(client, use_sudo=False, sudo_password=sudo_password, timeout=timeout)
+    return _parse_apt_simulation(out or "")
+
+def _apt_upgrade(client: paramiko.SSHClient, use_sudo: bool, sudo_password: Optional[str], timeout: int) -> Tuple[str,str,int]:
+    before = _apt_simulate(client, use_sudo=use_sudo, sudo_password=sudo_password, timeout=timeout)
+    _apt_update(client, use_sudo, sudo_password, timeout)
+    cmd=f"export DEBIAN_FRONTEND=noninteractive; apt-get -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' dist-upgrade"
+    if use_sudo:
+        ec, out, err = _exec_sudo(client, cmd, sudo_password or "", timeout=timeout)
+    else:
+        ec, out, err = _exec_stream(client, cmd, timeout=timeout)
+    after = _apt_simulate(client, use_sudo=use_sudo, sudo_password=sudo_password, timeout=timeout)
     changed = _apt_diff_before_after(before, after)
     return out, err, len(changed)
 
@@ -250,10 +256,10 @@ def main():
         if args.upgrade:
             upgrade_dnf(client, use_sudo, args.upgrade_timeout, stream=False, sudo_password=args.password)
     else:
-        before = _apt_simulate(client, use_sudo=False, sudo_password=args.password, timeout=args.timeout)
+        before = _apt_simulate(client, use_sudo=use_sudo, sudo_password=args.password, timeout=args.timeout)
         if args.upgrade:
-            _apt_upgrade(client, use_sudo, sudo_password=args.password, timeout=args.upgrade_timeout)
-        after = _apt_simulate(client, use_sudo=False, sudo_password=args.password, timeout=args.timeout)
+            _apt_upgrade(client, use_sudo=use_sudo, sudo_password=args.password, timeout=args.upgrade_timeout)
+        after = _apt_simulate(client, use_sudo=use_sudo, sudo_password=args.password, timeout=args.timeout)
         report["changed_packages"] = _apt_diff_before_after(before, after)
 
     reboot_needed = reboot_required(client, platform, use_sudo, args.password, args.timeout)
