@@ -1,124 +1,210 @@
 #!/usr/bin/env bash
 #
-# This script is run to pull the PaloAlto_Block_IP_List.txt file (maintained through Microsoft Sentinel)
-# from Azure storage and mirror it here for the Palo Altos to sync.
+# edl_sync.sh
 #
-# Purpose of this is to be in control of our certificate on this server.
-# A bad entry in this file coupled with an expired cert (maintained by Microsoft)
-# ended in an outage when the certificate was finally renewed.
+# Pulls PaloAlto_Block_IP_List.txt from Azure Blob Storage and mirrors it
+# locally for Palo Alto firewalls to sync via nginx.
 #
-# With this setup, we shouldn't have time bombs like that.
+# We own the TLS certificate on this server so we can handle cert errors
+# gracefully, rather than depending on Microsoft's cert renewal schedule.
 #
-# Errors:
-#   exit code 1 if curl exits with any code that is not certificate related
-#   exit code 2 if we do not get a 2xx response from the URL
+# Exit codes:
+#   1 — curl failed for a non-certificate reason
+#   2 — curl succeeded but the HTTP response was not 2xx
+#
+# Usage:
+#   ./edl_sync.sh                        # normal run
+#   ./edl_sync.sh https://your-test-url  # override URL for cert-error testing
+#                                        # (appends /foo to force a 404/cert error)
 
-set -uo pipefail
-# plain curl
-# - check rc
-# - if rc in cert_error_codes
-#   - log the error
-#   - rerun curl with -k option
-# - if rc -ne 0 && rc not in cert_error_codes
-#   - log the error
-#   - send an alert
-# - validate file (how?)
+set -euo pipefail
 
-PATH=/usr/bin
+# ---------------------------------------------------------------------------
+# Configuration — edit these as needed
+# ---------------------------------------------------------------------------
 
-IP_RE='(\b25[0-5]|\b2[0-4][0-9]|\b[01]?[0-9][0-9]?)(\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}'
+PATH=/usr/bin:/usr/sbin:/bin
 
-ip_v6='(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))'
+EDL_FILENAME="PaloAlto_Block_IP_List.txt"
+FILE_LOCATION=/usr/share/nginx/html
+GIT_REPO=/opt/edl
 
-cert_error_codes=(58 60 77 91 98)
+AZURE_URL="https://svc0secops0storageaccnt.blob.core.windows.net/testcont/${EDL_FILENAME}"
 
-# -s: silent (no console output
-# -S: show errors
-# -i: Include  the  HTTP  response  headers  in  the output.
-curl="curl -s -S -i"
+ALERT_RECIPIENTS=(
+    "dreynolds@epiqglobal.com"
+    "Eli.Johnson@epiqglobal.com"
+)
+ALERT_FROM="edl_sync@$(hostname)"
 
-file_location=/usr/share/nginx/html
+CURL_ERROR_CODES_FILE=/root/curls_error_codes
 
-edl_filename="PaloAlto_Block_IP_List.txt"
+# curl exit codes that indicate a certificate problem
+CERT_ERROR_CODES=(58 60 77 91 98)
 
-stamp=$(date +%F_%R:%S)
+# ---------------------------------------------------------------------------
+# Regex patterns
+# ---------------------------------------------------------------------------
 
-temp_file=/tmp/edl_filename_${stamp}
+# Matches a bare IPv4 address (e.g. 192.168.1.1)
+IP_V4='(\b25[0-5]|\b2[0-4][0-9]|\b[01]?[0-9][0-9]?)(\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}'
 
-url="https://svc0secops0storageaccnt.blob.core.windows.net/testcont/${edl_filename}"
+# Matches an IPv4 address optionally followed by a CIDR prefix (e.g. 10.0.0.0/8)
+IP_V4_WITH_CIDR="${IP_V4}(/([0-9]|[1-2][0-9]|3[0-2]))?"
 
-what_went_wrong() {
-    result=$1
+# Matches IPv6 addresses
+IP_V6='(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))'
 
-    curl_err=$(grep -E "^[[:space:]]+${result}[[:space:]]+" /root/curls_error_codes)
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+
+STAMP=$(date +%F_%R:%S)
+TEMP_FILE="/tmp/${EDL_FILENAME}_${STAMP}"
+CERT_RETRY_DONE=false   # guard against infinite recursion on cert retries
+URL="${AZURE_URL}"
+
+# ---------------------------------------------------------------------------
+# Cleanup — runs on any exit (normal, error, or signal)
+# ---------------------------------------------------------------------------
+
+cleanup() {
+    rm -f "${TEMP_FILE}"
 }
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+send_alert() {
+    local subject="$1"
+    local body="$2"
+    printf '%s' "${body}" \
+        | mailx -s "${subject}" -r "${ALERT_FROM}" "${ALERT_RECIPIENTS[@]}"
+}
+
+# Look up a curl exit code's description from the local reference file.
+describe_curl_error() {
+    local code="$1"
+    grep -E "^[[:space:]]+${code}[[:space:]]+" "${CURL_ERROR_CODES_FILE}" 2>/dev/null \
+        || echo "(no description found for curl exit code ${code})"
+}
+
+is_cert_error() {
+    local code="$1"
+    printf '%s\0' "${CERT_ERROR_CODES[@]}" | grep -Fxqz -- "${code}"
+}
+
+# ---------------------------------------------------------------------------
+# Core sync logic
+# ---------------------------------------------------------------------------
 
 get_the_payload() {
-    $curl "${url}" > "${temp_file}"
-    rc=$?
+    local curl_cmd="curl -s -S -i"
+    local rc=0
 
+    # First attempt — strict TLS verification
+    ${curl_cmd} "${URL}" > "${TEMP_FILE}" || rc=$?
 
-    # test for success
-    if [[ 0 -eq $rc ]]
-    then
-        grep -E "^$IP_RE.*$" "${temp_file}" > "${file_location}/${edl_filename}"
-        logger "curl: $edl_filename synchronized."
-        git -C "/opt/edl" add "$edl_filename"
-        git -C "/opt/edl" commit -m "$(date --iso-8601=seconds)" >/dev/null
+    # Handle curl errors
+    if [[ ${rc} -ne 0 ]]; then
+        local curl_err
+        curl_err=$(describe_curl_error "${rc}")
 
-    # check for certificate errors
-    elif printf '%s\0' "${cert_error_codes[@]}" | grep -Fxqz -- "$rc"
-#    elif [[ 0 -ne $rc && ${cert_error_codes[@]} =~ \b$rc\b ]]
-    then
-    # log the error
-        what_went_wrong $rc
-        message="curl: certificate error attempting to get ${url}: ${curl_err}"
-        logger "$message"
-        curl="$curl -k"
-        echo "trying again with $curl"
-        get_the_payload
+        if is_cert_error "${rc}"; then
+            # Certificate problem — log it and retry without cert verification,
+            # but only once to avoid infinite recursion.
+            local message="curl: certificate error (code ${rc}) fetching ${URL}: ${curl_err}"
+            logger "${message}"
+            echo "${message}"
 
-    # test for non-certificate errors
-    elif ! printf '%s\0' "${cert_error_codes[@]}" | grep -Fxqz -- "$rc"
-    then
-        # send alert
-        echo "${curl_err}" | mailx -s "curl failure: ${rc}" -r edl_sync@$(hostname) dreynolds@epiqglobal.com Eli.Johnson@epiqglobal.com
-        exit 1
+            if [[ "${CERT_RETRY_DONE}" == true ]]; then
+                echo "curl: cert-bypass retry already attempted. Giving up."
+                logger "curl: cert-bypass retry already attempted for ${EDL_FILENAME}. Giving up."
+                send_alert \
+                    "curl cert retry failed: ${EDL_FILENAME}" \
+                    "Both the normal and -k retries failed for ${URL}. Last error: ${curl_err}"
+                exit 1
+            fi
+
+            CERT_RETRY_DONE=true
+            echo "Retrying with certificate verification disabled (-k)..."
+            curl_cmd="${curl_cmd} -k"
+            rc=0
+            ${curl_cmd} "${URL}" > "${TEMP_FILE}" || rc=$?
+
+            if [[ ${rc} -ne 0 ]]; then
+                curl_err=$(describe_curl_error "${rc}")
+                logger "curl: -k retry also failed (code ${rc}): ${curl_err}"
+                send_alert \
+                    "curl failure (code ${rc}): ${EDL_FILENAME}" \
+                    "curl failed even with -k. Code: ${rc}. Error: ${curl_err}"
+                exit 1
+            fi
+
+        else
+            # Non-certificate curl error — alert and bail
+            logger "curl: non-certificate error (code ${rc}) fetching ${URL}: ${curl_err}"
+            send_alert \
+                "curl failure (code ${rc}): ${EDL_FILENAME}" \
+                "curl failed fetching ${URL}. Code: ${rc}. Error: ${curl_err}"
+            exit 1
+        fi
     fi
 
-    http_status=$(head -n 1 "${temp_file}" | grep -E -o '[0-9]{3}')
+    # Validate the HTTP status code from the response headers
+    local http_status
+    http_status=$(head -n 1 "${TEMP_FILE}" | grep -E -o '[0-9]{3}')
 
-    # bail if we get anything other than a 2xx return code
-    if [[ ! "$http_status" =~ ^2 ]]
-    then
-        message="curl: error $http_status when attempting to sync $edl_filename"
-        logger "$message"
-        echo "command: $curl ${url}" | sed -E 's#(https?)#\1 #' | mailx -s "$message" -r edl_sync@$(hostname) dreynolds@epiqglobal.com Eli.Johnson@epiqglobal.com
+    if [[ ! "${http_status}" =~ ^2 ]]; then
+        local message="curl: HTTP ${http_status} error syncing ${EDL_FILENAME} from ${URL}"
+        logger "${message}"
+        send_alert "${message}" "Command attempted: curl -s -S -i ${URL}"
         exit 2
     fi
-}
 
+    # Extract valid IPv4 entries (including CIDR notation) from the response,
+    # skipping HTTP headers and any malformed lines.
+    grep -E "^${IP_V4_WITH_CIDR}$" "${TEMP_FILE}" \
+        > "${FILE_LOCATION}/${EDL_FILENAME}"
 
-search_for_ipv6() {
-    ipv6_entries=$(grep -E "^$ip_v6.*$" "${temp_file}")
+    logger "curl: ${EDL_FILENAME} synchronized successfully."
 
-    if [[ "${ipv6_entries}" != '' ]]
-    then
-        echo -e "${ipv6_entries}" | mailx -s "ipv6 entries found in ${edl_filename}" -r edl_sync@$(hostname) dreynolds@epiqglobal.com Eli.Johnson@epiqglobal.com
+    # Commit to git if anything changed (suppress the "nothing to commit" case)
+    git -C "${GIT_REPO}" add "${EDL_FILENAME}"
+    if git -C "${GIT_REPO}" diff --cached --quiet; then
+        logger "git: no changes to ${EDL_FILENAME}, skipping commit."
+    else
+        git -C "${GIT_REPO}" commit -m "$(date --iso-8601=seconds)" >/dev/null
+        logger "git: committed changes to ${EDL_FILENAME}."
     fi
 }
 
-remove_temp_file() {
-    rm -f "${temp_file}"
+search_for_ipv6() {
+    local ipv6_entries
+    ipv6_entries=$(grep -E "^${IP_V6}" "${TEMP_FILE}" || true)
+
+    if [[ -n "${ipv6_entries}" ]]; then
+        logger "Warning: IPv6 entries found in ${EDL_FILENAME} — alerting."
+        send_alert \
+            "IPv6 entries found in ${EDL_FILENAME}" \
+            "${ipv6_entries}"
+    fi
 }
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
-
-# allow for testing cert errors
-if [[ $# -ge 1 && $1 =~ ^https:// ]]
-then
-    url="$1/foo"
+# Optional: pass an https:// URL as $1 to override the target for testing.
+# A /foo suffix is appended so you can trigger cert or 404 errors easily.
+if [[ $# -ge 1 && "$1" =~ ^https:// ]]; then
+    URL="${1}/foo"
+    echo "Test mode: overriding URL to ${URL}"
 fi
+
 get_the_payload
 search_for_ipv6
-remove_temp_file
+
+# cleanup() will remove TEMP_FILE via the EXIT trap
