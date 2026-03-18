@@ -1,210 +1,63 @@
-#!/usr/bin/env bash
-#
-# edl_sync.sh
-#
-# Pulls PaloAlto_Block_IP_List.txt from Azure Blob Storage and mirrors it
-# locally for Palo Alto firewalls to sync via nginx.
-#
-# We own the TLS certificate on this server so we can handle cert errors
-# gracefully, rather than depending on Microsoft's cert renewal schedule.
-#
-# Exit codes:
-#   1 — curl failed for a non-certificate reason
-#   2 — curl succeeded but the HTTP response was not 2xx
-#
-# Usage:
-#   ./edl_sync.sh                        # normal run
-#   ./edl_sync.sh https://your-test-url  # override URL for cert-error testing
-#                                        # (appends /foo to force a 404/cert error)
+Here's the rewritten script! Here's a quick rundown of every change made:
+Bugs fixed:
 
-set -euo pipefail
+HTTP status check now only runs after a confirmed successful curl call — no more checking headers on an empty or error file
+Infinite recursion is gone — a CERT_RETRY_DONE flag ensures the -k retry only ever fires once, and if that also fails it alerts and exits cleanly
+CIDR notation is now supported via IP_V4_WITH_CIDR — entries like 10.0.0.0/8 will no longer be silently dropped
 
-# ---------------------------------------------------------------------------
-# Configuration — edit these as needed
-# ---------------------------------------------------------------------------
+Reliability improvements:
 
-PATH=/usr/bin:/usr/sbin:/bin
+trap cleanup EXIT ensures the temp file is always removed, even if the script crashes or exits early mid-run
+CERT_RETRY_DONE flag replaces the recursive self-call with a clean inline retry — much easier to reason about
+Git "nothing to commit" is now handled gracefully with a diff --cached --quiet check before attempting the commit
 
-EDL_FILENAME="PaloAlto_Block_IP_List.txt"
-FILE_LOCATION=/usr/share/nginx/html
-GIT_REPO=/opt/edl
+Maintainability:
 
-AZURE_URL="https://svc0secops0storageaccnt.blob.core.windows.net/testcont/${EDL_FILENAME}"
+Email addresses are now a single ALERT_RECIPIENTS array at the top — change them in one place
+All config (paths, filename, URL, cert codes) is grouped in a clearly labeled block at the top of the script
+set -euo pipefail — added -e so unexpected failures don't silently continue
+PATH expanded to include /usr/sbin and /bin to ensure mailx, git, etc. are always findable
+Comments throughout explain why things are done, not just what
 
-ALERT_RECIPIENTS=(
-    "dreynolds@epiqglobal.com"
-    "Eli.Johnson@epiqglobal.com"
-)
-ALERT_FROM="edl_sync@$(hostname)"
+🔍 Overall Purpose
+The script syncs a Palo Alto IP blocklist from Azure Blob Storage to a local nginx directory, with cert-error resilience and git tracking. Good concept! Here's what needs attention:
 
-CURL_ERROR_CODES_FILE=/root/curls_error_codes
-
-# curl exit codes that indicate a certificate problem
-CERT_ERROR_CODES=(58 60 77 91 98)
-
-# ---------------------------------------------------------------------------
-# Regex patterns
-# ---------------------------------------------------------------------------
-
-# Matches a bare IPv4 address (e.g. 192.168.1.1)
-IP_V4='(\b25[0-5]|\b2[0-4][0-9]|\b[01]?[0-9][0-9]?)(\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}'
-
-# Matches an IPv4 address optionally followed by a CIDR prefix (e.g. 10.0.0.0/8)
-IP_V4_WITH_CIDR="${IP_V4}(/([0-9]|[1-2][0-9]|3[0-2]))?"
-
-# Matches IPv6 addresses
-IP_V6='(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))'
-
-# ---------------------------------------------------------------------------
-# State
-# ---------------------------------------------------------------------------
-
-STAMP=$(date +%F_%R:%S)
-TEMP_FILE="/tmp/${EDL_FILENAME}_${STAMP}"
-CERT_RETRY_DONE=false   # guard against infinite recursion on cert retries
-URL="${AZURE_URL}"
-
-# ---------------------------------------------------------------------------
-# Cleanup — runs on any exit (normal, error, or signal)
-# ---------------------------------------------------------------------------
-
-cleanup() {
-    rm -f "${TEMP_FILE}"
-}
-trap cleanup EXIT
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-send_alert() {
-    local subject="$1"
-    local body="$2"
-    printf '%s' "${body}" \
-        | mailx -s "${subject}" -r "${ALERT_FROM}" "${ALERT_RECIPIENTS[@]}"
-}
-
-# Look up a curl exit code's description from the local reference file.
-describe_curl_error() {
-    local code="$1"
-    grep -E "^[[:space:]]+${code}[[:space:]]+" "${CURL_ERROR_CODES_FILE}" 2>/dev/null \
-        || echo "(no description found for curl exit code ${code})"
-}
-
-is_cert_error() {
-    local code="$1"
-    printf '%s\0' "${CERT_ERROR_CODES[@]}" | grep -Fxqz -- "${code}"
-}
-
-# ---------------------------------------------------------------------------
-# Core sync logic
-# ---------------------------------------------------------------------------
-
-get_the_payload() {
-    local curl_cmd="curl -s -S -i"
-    local rc=0
-
-    # First attempt — strict TLS verification
-    ${curl_cmd} "${URL}" > "${TEMP_FILE}" || rc=$?
-
-    # Handle curl errors
-    if [[ ${rc} -ne 0 ]]; then
-        local curl_err
-        curl_err=$(describe_curl_error "${rc}")
-
-        if is_cert_error "${rc}"; then
-            # Certificate problem — log it and retry without cert verification,
-            # but only once to avoid infinite recursion.
-            local message="curl: certificate error (code ${rc}) fetching ${URL}: ${curl_err}"
-            logger "${message}"
-            echo "${message}"
-
-            if [[ "${CERT_RETRY_DONE}" == true ]]; then
-                echo "curl: cert-bypass retry already attempted. Giving up."
-                logger "curl: cert-bypass retry already attempted for ${EDL_FILENAME}. Giving up."
-                send_alert \
-                    "curl cert retry failed: ${EDL_FILENAME}" \
-                    "Both the normal and -k retries failed for ${URL}. Last error: ${curl_err}"
-                exit 1
-            fi
-
-            CERT_RETRY_DONE=true
-            echo "Retrying with certificate verification disabled (-k)..."
-            curl_cmd="${curl_cmd} -k"
-            rc=0
-            ${curl_cmd} "${URL}" > "${TEMP_FILE}" || rc=$?
-
-            if [[ ${rc} -ne 0 ]]; then
-                curl_err=$(describe_curl_error "${rc}")
-                logger "curl: -k retry also failed (code ${rc}): ${curl_err}"
-                send_alert \
-                    "curl failure (code ${rc}): ${EDL_FILENAME}" \
-                    "curl failed even with -k. Code: ${rc}. Error: ${curl_err}"
-                exit 1
-            fi
-
-        else
-            # Non-certificate curl error — alert and bail
-            logger "curl: non-certificate error (code ${rc}) fetching ${URL}: ${curl_err}"
-            send_alert \
-                "curl failure (code ${rc}): ${EDL_FILENAME}" \
-                "curl failed fetching ${URL}. Code: ${rc}. Error: ${curl_err}"
-            exit 1
-        fi
-    fi
-
-    # Validate the HTTP status code from the response headers
-    local http_status
-    http_status=$(head -n 1 "${TEMP_FILE}" | grep -E -o '[0-9]{3}')
-
-    if [[ ! "${http_status}" =~ ^2 ]]; then
-        local message="curl: HTTP ${http_status} error syncing ${EDL_FILENAME} from ${URL}"
-        logger "${message}"
-        send_alert "${message}" "Command attempted: curl -s -S -i ${URL}"
-        exit 2
-    fi
-
-    # Extract valid IPv4 entries (including CIDR notation) from the response,
-    # skipping HTTP headers and any malformed lines.
-    grep -E "^${IP_V4_WITH_CIDR}$" "${TEMP_FILE}" \
-        > "${FILE_LOCATION}/${EDL_FILENAME}"
-
-    logger "curl: ${EDL_FILENAME} synchronized successfully."
-
-    # Commit to git if anything changed (suppress the "nothing to commit" case)
-    git -C "${GIT_REPO}" add "${EDL_FILENAME}"
-    if git -C "${GIT_REPO}" diff --cached --quiet; then
-        logger "git: no changes to ${EDL_FILENAME}, skipping commit."
-    else
-        git -C "${GIT_REPO}" commit -m "$(date --iso-8601=seconds)" >/dev/null
-        logger "git: committed changes to ${EDL_FILENAME}."
-    fi
-}
-
-search_for_ipv6() {
-    local ipv6_entries
-    ipv6_entries=$(grep -E "^${IP_V6}" "${TEMP_FILE}" || true)
-
-    if [[ -n "${ipv6_entries}" ]]; then
-        logger "Warning: IPv6 entries found in ${EDL_FILENAME} — alerting."
-        send_alert \
-            "IPv6 entries found in ${EDL_FILENAME}" \
-            "${ipv6_entries}"
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-# Optional: pass an https:// URL as $1 to override the target for testing.
-# A /foo suffix is appended so you can trigger cert or 404 errors easily.
-if [[ $# -ge 1 && "$1" =~ ^https:// ]]; then
-    URL="${1}/foo"
-    echo "Test mode: overriding URL to ${URL}"
+🐛 Bugs
+1. The HTTP status check happens even after curl errors
+The http_status check at the bottom of get_the_payload() runs regardless of whether curl succeeded or failed. If curl fails with a non-cert error and you exit 1, you're fine — but if it's a cert error and the retry also fails, you'll hit that http_status check with a garbage or empty temp file.
+2. Infinite recursion risk on cert errors
+When a cert error is detected, the function calls itself recursively (get_the_payload). If the -k retry also hits a cert error somehow (unlikely but possible), it'll recurse forever. There's no guard against that.
+3. grep on the temp file filters out the HTTP headers — but also might filter valid IPs
+bashgrep -E "^$IP_RE.*$" "${temp_file}" > "${file_location}/${edl_filename}"
+The raw curl output (due to -i) includes HTTP headers at the top. The IP regex should skip those, but CIDR notation like 192.168.1.0/24 won't match either — the regex only handles bare IPs with no prefix length. If the blocklist uses CIDR ranges, those silently get dropped. 🚨
+4. what_went_wrong() result is never actually used cleanly
+bashcurl_err=$(grep -E "^[[:space:]]+${result}[[:space:]]+" /root/curls_error_codes)
+This sets a local variable curl_err inside the function… except curl_err is used outside the function in the caller. In bash, functions don't have their own scope for variables like this, so it actually does work — but it's fragile and confusing. If someone refactors this, it'll break silently.
+5. The URL test at the bottom is a little off
+bashif [[ $# -ge 1 && $1 =~ ^https:// ]]
+then
+    url="$1/foo"
 fi
+It appends /foo to whatever URL you pass in for testing. That's probably intentional for cert-error simulation, but it's not documented and would confuse anyone maintaining this later.
 
-get_the_payload
-search_for_ipv6
+⚠️ Potential Issues
+6. set -uo pipefail but no -e
+You have -u (fail on unbound vars) and -o pipefail, but not -e (exit on error). This means failed commands mid-script won't stop execution unless you're explicitly checking return codes. Worth being intentional about that.
+7. The git commit will fail silently if there are no changes
+bashgit -C "/opt/edl" commit -m "..." >/dev/null
+If the file didn't change, git commit exits with a non-zero code (nothing to commit). Since you're not checking that RC, it fails quietly — probably fine, but worth a comment so nobody panics when they see it in logs.
+8. The temp file won't be cleaned up if the script exits early
+remove_temp_file() is only called at the very end. If exit 1 or exit 2 fires inside get_the_payload(), the temp file is left behind in /tmp. A trap would solve this elegantly:
+bashtrap remove_temp_file EXIT
+9. Hardcoded email addresses
+dreynolds@epiqglobal.com and Eli.Johnson@epiqglobal.com are baked in throughout. These should really be variables at the top of the script so they're easy to update.
+10. PATH=/usr/bin might be too restrictive
+mailx, git, logger, and grep all need to be reachable. On some systems these live in /usr/sbin or /bin. Worth double-checking or at least documenting the assumption.
 
-# cleanup() will remove TEMP_FILE via the EXIT trap
+✅ Things Done Well
+
+Using a regex to validate IPs before writing to the blocklist — smart safeguard
+Logging with logger so events end up in syslog
+Git tracking of changes — great audit trail idea
+Separating cert errors from other errors with different handling paths
+Cleaning up the temp file (just needs the trap fix above)
